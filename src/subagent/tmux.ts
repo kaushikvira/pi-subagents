@@ -21,6 +21,39 @@ function tmuxCmdQuiet(args: string[]): string {
   }
 }
 
+// ─── Pane-existence TTL cache ─────────────────────────────────────────────────
+//
+// `paneExists`/`paneDead` are called once per task on the 10s background poll
+// and up to twice per second on foreground waits, each an execFileSync("tmux")
+// that blocks the main thread. These are existence checks on slowly-changing
+// state, so the raw `display-message` result is cached per pane id for a short
+// TTL. Decision-critical callers (steer, restore, failure diagnostics) pass
+// `fresh: true` to force a live check; the decision logic itself is unchanged.
+
+const TMUX_PANE_CHECK_TTL_MS = 5_000;
+const paneCheckCache = new Map<string, { at: number; result: string }>();
+
+function tmuxDisplayPane(
+  paneId: string,
+  format: string,
+  options?: { fresh?: boolean },
+): string {
+  const key = `${paneId}\u0000${format}`;
+  const now = Date.now();
+  if (!options?.fresh) {
+    const hit = paneCheckCache.get(key);
+    if (hit && now - hit.at < TMUX_PANE_CHECK_TTL_MS) return hit.result;
+  }
+  const result = tmuxCmdQuiet(["display-message", "-p", "-t", paneId, format]);
+  paneCheckCache.set(key, { at: now, result });
+  if (paneCheckCache.size > 512) {
+    for (const [cachedKey, cached] of paneCheckCache) {
+      if (now - cached.at >= TMUX_PANE_CHECK_TTL_MS) paneCheckCache.delete(cachedKey);
+    }
+  }
+  return result;
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -85,12 +118,18 @@ export function setPaneSelfDestruct(paneId: string, enabled: boolean, delaySecon
   tmuxCmdQuiet(["set-hook", "-p", "-t", paneId, "pane-died", hook]);
 }
 
-export function paneExists(paneId: string): boolean {
-  return tmuxCmdQuiet(["display-message", "-p", "-t", paneId, "#{pane_id}"]) === paneId;
+export function paneExists(
+  paneId: string,
+  options?: { fresh?: boolean },
+): boolean {
+  return tmuxDisplayPane(paneId, "#{pane_id}", options) === paneId;
 }
 
-export function paneDead(paneId: string): boolean {
-  const value = tmuxCmdQuiet(["display-message", "-p", "-t", paneId, "#{pane_dead}"]);
+export function paneDead(
+  paneId: string,
+  options?: { fresh?: boolean },
+): boolean {
+  const value = tmuxDisplayPane(paneId, "#{pane_dead}", options);
   return value === "1" || value === "";
 }
 

@@ -55,6 +55,14 @@ export interface RegistryEntry {
   sessionRef?: string;
   worktree?: WorktreeHandle;
   worktreeResult?: WorktreeResult;
+  /**
+   * Set when a restore-time liveness check THREW (e.g. Herdr down at load)
+   * instead of answering: the entry was left in the registry for the next
+   * session's restore rather than silently dropped, so a still-running
+   * background task cannot go unpolled without a visible trace.
+   */
+  restoreQuarantineReason?: string;
+  restoreQuarantinedAt?: string;
 }
 
 /** Durable task→session mapping used for resume after task completion. */

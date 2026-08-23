@@ -11,6 +11,10 @@ import { parseToolList } from "./agent-tools.js";
 import { parseMergedDisallowedTools } from "./policy.js";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
+  matchesJsonlTailViewSessionName,
+  readJsonlTailViews,
+} from "./session-tail-cache.js";
+import {
   buildPiArgv,
   type PiPromptLaunchOptions,
 } from "./subagent/buildArgv.js";
@@ -758,31 +762,12 @@ export function formatAgentList(agents: AgentConfig[]): string {
 
     // ─── JSONL Session Helpers ───────────────────────────────────────────────────
 
-    function matchesJsonlSessionName(content: string, sessionName?: string): boolean {
-      if (!sessionName) return true;
-
-      for (const rawLine of content.split("\n")) {
-        const line = rawLine.trim();
-        if (!line) continue;
-
-        try {
-          const entry = JSON.parse(line) as {
-            type?: string;
-            name?: string;
-            session_info?: { name?: string };
-          };
-          if (entry.type === "session_info") {
-            return (entry.name ?? entry.session_info?.name) === sessionName;
-          }
-        } catch {
-          // Skip malformed lines
-        }
-      }
-
-      return false;
-    }
-    
-    /** Count tool uses and turns from pi JSONL session files. */
+    /**
+     * Count tool uses and turns from pi JSONL session files.
+     * Reads go through the incremental tail cache (only appended bytes are
+     * read and parsed), so the 1s progress poll no longer re-reads the whole
+     * session on every tick.
+     */
     export function countToolUses(
       sessionDir: string,
       sessionName?: string,
@@ -792,40 +777,33 @@ export function formatAgentList(agents: AgentConfig[]): string {
     } {
       let toolUses = 0;
       let turns = 0;
-    
+
       try {
         if (!existsSync(sessionDir)) return { toolUses, turns };
-    
-        const files = readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
-        for (const file of files) {
-          const content = readFileSync(join(sessionDir, file), "utf-8");
-          if (!matchesJsonlSessionName(content, sessionName)) continue;
 
-          for (const rawLine of content.split("\n")) {
-            const line = rawLine.trim();
-            if (!line) continue;
-    
-            try {
-              const entry = JSON.parse(line);
-              if (
-                entry.type === "message" &&
-                entry.message?.role === "assistant" &&
-                Array.isArray(entry.message.content)
-              ) {
-                turns++;
-                for (const block of entry.message.content) {
-                  if (block.type === "toolCall") toolUses++;
-                }
-              }
-            } catch {
-              // Skip malformed lines
+        const views = readJsonlTailViews(sessionDir);
+        for (const view of views) {
+          if (!matchesJsonlTailViewSessionName(view, sessionName)) continue;
+
+          for (const entry of view.entries) {
+            if (entry.type !== "message") continue;
+            const msg = entry.message;
+            if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
+
+            turns++;
+            for (const block of msg.content) {
+              // A null/undefined block aborted this line in the fresh-read
+              // helper (property access threw inside the per-line catch):
+              // the turn was counted, but blocks after it were not.
+              if (block === null || block === undefined) break;
+              if (isUnknownRecord(block) && block.type === "toolCall") toolUses++;
             }
           }
         }
       } catch {
         // Session dir might not exist or be inaccessible
       }
-    
+
       return { toolUses, turns };
     }
 
@@ -911,24 +889,13 @@ export function summarizeArgs(toolName: string, args: unknown): string {
   try {
     if (!existsSync(sessionDir)) return { toolUses, turns, recent: [] };
 
-        const files = readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
-        for (const file of files) {
-          const content = readFileSync(join(sessionDir, file), "utf-8");
-          if (!matchesJsonlSessionName(content, sessionName)) continue;
+    const views = readJsonlTailViews(sessionDir);
+    for (const view of views) {
+      if (!matchesJsonlTailViewSessionName(view, sessionName)) continue;
 
-          for (const rawLine of content.split("\n")) {
-        const line = rawLine.trim();
-        if (!line) continue;
-
-        let entry: unknown;
-        try {
-          entry = JSON.parse(line) as unknown;
-        } catch {
-          continue;
-        }
-
-        if (!isUnknownRecord(entry) || !isUnknownRecord(entry.message)) continue;
+      for (const entry of view.entries) {
         const msg = entry.message;
+        if (typeof msg !== "object" || msg === null) continue;
 
         // Collect tool results first so we can match them to tool calls
         if (msg.role === "toolResult") {

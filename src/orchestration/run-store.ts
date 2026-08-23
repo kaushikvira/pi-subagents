@@ -15,6 +15,18 @@ import { withFileLock } from "./file-lock.js";
 
 const RUN_STORE_VERSION = 1;
 
+/**
+ * Retention for TERMINAL runs in the run store. The store used to grow
+ * without bound: every heartbeat, launch event, and pending-completion
+ * retry paid a lock + full read + full rewrite of `runs.json`, so the cost
+ * was O(all tasks ever) on a hot path. Terminal runs older than this window
+ * are pruned (lazily, on write, when the store exceeds the cap below).
+ */
+export const RUN_STORE_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000; // 7 days
+
+/** Hard cap on stored runs; oldest prunable terminal runs shed beyond it. */
+export const RUN_STORE_MAX_RUNS = 1_000;
+
 export type TaskExecutionPhase =
   | "allocating"
   | "starting"
@@ -422,10 +434,56 @@ async function withRunStore<T>(
     operation: async () => {
       const document = await readRunStore(storePath);
       const result = await operation(document);
+      // Lazy retention: only when the store is over the cap, and only on the
+      // write path — reads stay cheap and never rewrite the store.
+      pruneRunStore(document);
       await writeRunStore(storePath, document);
       return result;
     },
   });
+}
+
+/** Whether a terminal run is safe to drop from the store. */
+function isPrunableRun(run: DurableTaskRun, nowMs: number): boolean {
+  if (!isTerminalExecutionPhase(run.executionPhase)) return false;
+  // An unexpired lease means the run can still be re-established or reviewed.
+  if (run.lease && Date.parse(run.lease.expiresAt) > nowMs) return false;
+  // A pending durable decision is in-flight work, not history: a decision
+  // response resumes through the run's correlation and must find it.
+  if (run.decisionRequest?.status === "pending") return false;
+  return true;
+}
+
+/**
+ * Drop terminal runs that outgrew retention. Triggered lazily on write only
+ * when the store is over the cap; under the cap the store is untouched so a
+ * quiet project never pays a pruning rewrite.
+ *
+ * Two bounds: the retention window (terminal runs older than it are stale
+ * history), and the hard cap (the oldest prunable terminal runs are shed to
+ * get back under it, even if younger than the window — an unbounded store is
+ * exactly the growth being fixed).
+ */
+function pruneRunStore(document: RunStoreDocument): void {
+  if (document.runs.length <= RUN_STORE_MAX_RUNS) return;
+  const nowMs = Date.now();
+  const cutoffMs = nowMs - RUN_STORE_RETENTION_MS;
+
+  document.runs = document.runs.filter((run) => {
+    if (!isPrunableRun(run, nowMs)) return true;
+    const updatedAtMs = Date.parse(run.updatedAt);
+    return !(Number.isFinite(updatedAtMs) && updatedAtMs < cutoffMs);
+  });
+
+  if (document.runs.length <= RUN_STORE_MAX_RUNS) return;
+
+  const prunable = document.runs
+    .filter((run) => isPrunableRun(run, nowMs))
+    .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+  const toDrop = new Set(
+    prunable.slice(0, document.runs.length - RUN_STORE_MAX_RUNS).map((run) => run.invocationId),
+  );
+  document.runs = document.runs.filter((run) => !toDrop.has(run.invocationId));
 }
 
 /** Reporter for a run store that had to be quarantined; wired by the runtime. */

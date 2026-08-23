@@ -1,9 +1,18 @@
 /**
  * Read assistant text from pi JSONL session directories used by task sessions.
+ *
+ * All reads go through the incremental tail cache (session-tail-cache.ts):
+ * only bytes appended since the last poll are read and parsed, so the 1s
+ * completion/progress polls and the 3s/10s stats polls no longer pay a full
+ * re-read + full re-parse of every session file on every tick.
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import {
+  matchesJsonlTailViewSessionName,
+  readJsonlTailViews,
+  type SessionJsonlEntry,
+} from "./session-tail-cache.js";
 
 function extractText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -15,27 +24,16 @@ function extractText(content: unknown): string {
     .trim();
 }
 
-function matchesSessionName(content: string, sessionName?: string): boolean {
-  if (!sessionName) return true;
-
-  for (const rawLine of content.split("\n")) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    try {
-      const entry = JSON.parse(line) as {
-        type?: string;
-        name?: string;
-        session_info?: { name?: string };
-      };
-      if (entry.type === "session_info") {
-        return (entry.name ?? entry.session_info?.name) === sessionName;
-      }
-    } catch {
-      /* skip malformed JSONL rows */
-    }
-  }
-
-  return false;
+/**
+ * Whether a parsed line passes the `sinceMs` timestamp filter, with the same
+ * semantics as the original per-line scan: lines without a timestamp are
+ * always kept, and only finite timestamps before `sinceMs` are dropped.
+ */
+function passesSinceFilter(entry: SessionJsonlEntry, sinceMs?: number): boolean {
+  if (sinceMs === undefined) return true;
+  if (typeof entry.timestamp !== "string" || !entry.timestamp) return true;
+  const timestampMs = Date.parse(entry.timestamp);
+  return !(Number.isFinite(timestampMs) && timestampMs < sinceMs);
 }
 
 /**
@@ -53,34 +51,17 @@ export function getAgentTerminalStopReason(
 ): string | undefined {
   if (!existsSync(sessionDir)) return undefined;
 
-  const files = readdirSync(sessionDir)
-    .filter((f) => f.endsWith(".jsonl"))
-    .sort();
+  const views = readJsonlTailViews(sessionDir);
 
   let lastStopReason: string | undefined;
-  for (const file of files) {
-    const content = readFileSync(join(sessionDir, file), "utf-8");
-    if (!matchesSessionName(content, sessionName)) continue;
-    for (const rawLine of content.split("\n")) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      try {
-        const entry = JSON.parse(line) as {
-          type?: string;
-          timestamp?: string;
-          message?: { role?: string; stopReason?: string };
-        };
-        if (entry.type !== "message") continue;
-        if (sinceMs !== undefined && entry.timestamp) {
-          const timestampMs = Date.parse(entry.timestamp);
-          if (Number.isFinite(timestampMs) && timestampMs < sinceMs) continue;
-        }
-        const msg = entry.message;
-        if (msg?.role === "assistant" && typeof msg.stopReason === "string") {
-          lastStopReason = msg.stopReason;
-        }
-      } catch {
-        /* skip malformed JSONL rows */
+  for (const view of views) {
+    if (!matchesJsonlTailViewSessionName(view, sessionName)) continue;
+    for (const entry of view.entries) {
+      if (entry.type !== "message") continue;
+      if (!passesSinceFilter(entry, sinceMs)) continue;
+      const msg = entry.message;
+      if (msg?.role === "assistant" && typeof msg.stopReason === "string") {
+        lastStopReason = msg.stopReason;
       }
     }
   }
@@ -111,36 +92,19 @@ export function getLastAssistantTextFromSessionDir(
 ): string {
   if (!existsSync(sessionDir)) return "";
 
-  const files = readdirSync(sessionDir)
-    .filter((f) => f.endsWith(".jsonl"))
-    .sort();
+  const views = readJsonlTailViews(sessionDir);
 
   let last = "";
-  for (const file of files) {
-    const content = readFileSync(join(sessionDir, file), "utf-8");
-    if (!matchesSessionName(content, sessionName)) continue;
+  for (const view of views) {
+    if (!matchesJsonlTailViewSessionName(view, sessionName)) continue;
 
-    for (const rawLine of content.split("\n")) {
-      const line = rawLine.trim();
-      if (!line) continue;
-      try {
-        const entry = JSON.parse(line) as {
-          type?: string;
-          timestamp?: string;
-          message?: { role?: string; content?: unknown };
-        };
-        if (entry.type !== "message") continue;
-        if (sinceMs !== undefined && entry.timestamp) {
-          const timestampMs = Date.parse(entry.timestamp);
-          if (Number.isFinite(timestampMs) && timestampMs < sinceMs) continue;
-        }
-        const msg = entry.message;
-        if (!msg || msg.role !== "assistant") continue;
-        const text = extractText(msg.content);
-        if (text) last = text;
-      } catch {
-        /* skip malformed JSONL rows */
-      }
+    for (const entry of view.entries) {
+      if (entry.type !== "message") continue;
+      if (!passesSinceFilter(entry, sinceMs)) continue;
+      const msg = entry.message;
+      if (!msg || msg.role !== "assistant") continue;
+      const text = extractText(msg.content);
+      if (text) last = text;
     }
   }
   return last;

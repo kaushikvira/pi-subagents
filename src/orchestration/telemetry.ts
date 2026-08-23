@@ -7,6 +7,7 @@ import {
   rename,
   stat,
   truncate,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
@@ -64,7 +65,17 @@ export type OrchestrationEventType = (typeof ORCHESTRATION_EVENT_TYPES)[number];
  * O(1) regardless, but every reader (metrics, doctor, replay, review dedup)
  * parses whatever is live, so an unbounded file degrades them all.
  */
-const MAX_SEGMENT_BYTES = 4 * 1024 * 1024;
+export const MAX_SEGMENT_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Rotated segments are kept only while at most this many exist. The journal
+ * used to rotate 4 MB segments forever: disk grew without bound and every
+ * reader (replay, review dedup, metrics, doctor) parsed every segment ever
+ * written. Rotation now deletes the oldest segments past this cap, and the
+ * readers below only ever load live + the newest `MAX_ROTATED_SEGMENTS`
+ * rotated segments.
+ */
+export const MAX_ROTATED_SEGMENTS = 10;
 
 export interface TaskUsageSummary {
   inputTokens: number;
@@ -247,7 +258,10 @@ async function rebuildJournalIndex(
   eventPath: string,
   liveBytes: number,
 ): Promise<JournalIndex> {
-  const segments = await listRotatedSegments(eventPath);
+  // Sequences are monotonic in append order, so the high-water mark lives in
+  // the most recent segments; the retention cap bounds how far back a rebuild
+  // (or any reader) ever has to scan.
+  const segments = (await listRotatedSegments(eventPath)).slice(-MAX_ROTATED_SEGMENTS);
   let lastSequence = 0;
   for (const segment of segments) {
     for (const event of await readSegment(segment.path)) {
@@ -290,6 +304,25 @@ async function rotateJournal(eventPath: string, index: JournalIndex): Promise<vo
   index.generation += 1;
   index.bytes = 0;
   index.keyed = {};
+  await pruneRotatedSegments(eventPath);
+}
+
+/**
+ * Delete rotated segments beyond the retention cap (keep the newest
+ * `MAX_ROTATED_SEGMENTS`). Runs under the journal lock, on rotation only.
+ */
+async function pruneRotatedSegments(eventPath: string): Promise<void> {
+  const segments = await listRotatedSegments(eventPath);
+  const excess = segments.slice(0, Math.max(0, segments.length - MAX_ROTATED_SEGMENTS));
+  await Promise.all(
+    excess.map((segment) =>
+      unlink(segment.path).catch(() => {
+        // Deletion is best-effort: a segment that cannot be deleted (busy,
+        // permissions) is retried on the next rotation, and readers only
+        // ever load the newest cap, so it never blocks appends.
+      }),
+    ),
+  );
 }
 
 function rotatedSegmentPath(eventPath: string, generation: number): string {
@@ -428,12 +461,16 @@ async function repairJournalTail(path: string): Promise<void> {
  *
  * Callers depend on seeing the whole history — replay hashes a prefix chain
  * over it, review dedup looks for an earlier verdict, metrics count from the
- * beginning — so rotation must be invisible here.
+ * beginning. Rotation is invisible within the retention window (live + the
+ * newest `MAX_ROTATED_SEGMENTS` rotated segments); beyond it, history is
+ * deliberately bounded — a replay cursor whose window was deleted fails
+ * validation with "journal was truncated" rather than forcing unbounded disk
+ * and parse cost on every read.
  */
 export async function readOrchestrationEvents(
   eventPath: string,
 ): Promise<OrchestrationEvent[]> {
-  const segments = await listRotatedSegments(eventPath);
+  const segments = (await listRotatedSegments(eventPath)).slice(-MAX_ROTATED_SEGMENTS);
   if (segments.length === 0) return readSegment(eventPath);
 
   const events: OrchestrationEvent[] = [];

@@ -23,6 +23,9 @@ export function restoreActiveBackgroundTasks(
 ): void {
   const registry = readRegistry(piDir);
   const staleIds: string[] = [];
+  // True once a quarantine marker was written or cleared: the durable
+  // registry must be re-persisted even when nothing was removed.
+  let registryDirty = false;
 
   for (const entry of registry) {
     if (!existsSync(entry.dir)) {
@@ -47,14 +50,38 @@ export function restoreActiveBackgroundTasks(
     const paneId = entry.handle?.resourceId ?? entry.paneId;
     let paneAlive: boolean;
     try {
+      // Fresh check: a restore decision must never ride on a TTL-cached pane
+      // observation from a poll earlier in this process.
       paneAlive = resourceExists
         ? resourceExists(entry)
         : entry.handle?.backend === "herdr"
           ? false
-          : Boolean(paneId && paneExists(paneId));
-    } catch {
-      // A temporary backend outage must not destroy the durable task record.
+          : Boolean(paneId && paneExists(paneId, { fresh: true }));
+    } catch (error) {
+      // A temporary backend outage must not destroy the durable task record,
+      // but a silent `continue` is what left still-running background tasks
+      // unpolled for the whole session with no trace. Quarantine the entry
+      // in the durable registry (same mark/persist/report vocabulary as the
+      // store quarantine) so the next session's restore picks it up, and
+      // note it where an operator can see it.
+      const reason = error instanceof Error ? error.message : String(error);
+      entry.restoreQuarantineReason = `liveness check threw: ${reason}`;
+      entry.restoreQuarantinedAt = new Date().toISOString();
+      registryDirty = true;
+      console.warn(
+        `[pi-subagents] Liveness check failed for background task ${entry.id} ` +
+          `(${entry.sessionName}): ${reason}. The entry was quarantined in the ` +
+          `task registry for the next session restore; it will not be polled ` +
+          `this session.`,
+      );
       continue;
+    }
+    if (entry.restoreQuarantinedAt !== undefined) {
+      // The check succeeded this time: the quarantined entry is back in the
+      // poll loop, so drop the durable marker.
+      delete entry.restoreQuarantinedAt;
+      delete entry.restoreQuarantineReason;
+      registryDirty = true;
     }
 
     if (sessionFinished) {
@@ -143,7 +170,7 @@ export function restoreActiveBackgroundTasks(
     });
   }
 
-  if (staleIds.length) {
+  if (staleIds.length || registryDirty) {
     writeRegistry(
       piDir,
       registry.filter((entry) => !staleIds.includes(entry.id)),

@@ -127,6 +127,95 @@ describe("restoreActiveBackgroundTasks", () => {
     assert.equal(readJson<Array<{ id: string }>>(join(piDir, "task-registry.json"))[0]?.id, "task-herdr");
   });
 
+  it("quarantines a registry entry when the liveness check throws", () => {
+    const piDir = makePiDir();
+    const taskDir = join(piDir, "artifacts", "sessions", "task-quarantine");
+    writeSession(taskDir, "task-task-quarantine");
+    writeJson(join(piDir, "task-registry.json"), [
+      {
+        id: "task-quarantine",
+        dir: taskDir,
+        sessionName: "task-task-quarantine",
+        startedAt: Date.now() - 1000,
+        paneId: "w1:p2",
+        handle: {
+          backend: "herdr",
+          resourceId: "w1:p2",
+          socketPath: "/tmp/herdr.sock",
+          terminalId: "term-2",
+        },
+        agentType: "scout",
+        description: "backend down at load",
+        background: true,
+      },
+    ]);
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    let backgroundTasks: Map<string, unknown>;
+    try {
+      backgroundTasks = new Map();
+      restoreActiveBackgroundTasks(piDir, backgroundTasks, () => {
+        const error = new Error("connection refused");
+        error.name = "HerdrUnavailableError";
+        throw error;
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    // The entry is left in the durable registry (not silently dropped) and is
+    // marked quarantined so the next session's restore can pick it up.
+    const [stored] = readJson<
+      Array<{ id: string; restoreQuarantinedAt?: string; restoreQuarantineReason?: string }>
+    >(join(piDir, "task-registry.json"));
+    assert.equal(stored?.id, "task-quarantine");
+    assert.ok(stored?.restoreQuarantinedAt);
+    assert.match(stored?.restoreQuarantineReason ?? "", /liveness check threw/u);
+    assert.equal(backgroundTasks!.size, 0);
+    assert.equal(
+      warnings.some((line) => line.includes("task-quarantine")),
+      true,
+      "a visible console note must report the quarantined entry",
+    );
+  });
+
+  it("clears a quarantine marker once the liveness check succeeds", () => {
+    const piDir = makePiDir();
+    const taskDir = join(piDir, "artifacts", "sessions", "task-quarantine-recovered");
+    writeSession(taskDir, "task-task-quarantine-recovered");
+    writeJson(join(piDir, "task-registry.json"), [
+      {
+        id: "task-quarantine-recovered",
+        dir: taskDir,
+        sessionName: "task-task-quarantine-recovered",
+        startedAt: Date.now() - 1000,
+        paneId: "w1:p2",
+        agentType: "scout",
+        description: "recovered task",
+        background: true,
+        restoreQuarantineReason: "liveness check threw: connection refused",
+        restoreQuarantinedAt: new Date().toISOString(),
+      },
+    ]);
+
+    const backgroundTasks = new Map();
+    // The check succeeds this time: the quarantined entry is restored into
+    // the poll loop.
+    restoreActiveBackgroundTasks(piDir, backgroundTasks, () => true);
+
+    // Restored into the poll loop, and the marker is cleared durably.
+    assert.equal(backgroundTasks.size, 1);
+    const [stored] = readJson<
+      Array<{ id: string; restoreQuarantinedAt?: string }>
+    >(join(piDir, "task-registry.json"));
+    assert.equal(stored?.id, "task-quarantine-recovered");
+    assert.equal(stored?.restoreQuarantinedAt, undefined);
+  });
+
   it("marks non-terminal entries failed when their pane is gone", () => {
     const piDir = makePiDir();
     const taskDir = join(piDir, "artifacts", "sessions", "task-2");

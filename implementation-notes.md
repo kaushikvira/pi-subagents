@@ -44,6 +44,13 @@ Built-in `edit` and `write` tools are guarded through Pi's global `tool_call` ev
 - Metadata is display-only and never takes lifecycle authority from Herdr's Pi integration.
 - Cleanup is parent-owned and verifies terminal identity before closing resources.
 
+## Performance hot paths
+
+- Session JSONL reads (stop reason, last assistant text, tool-use stats) go through an incremental tail cache (`src/session-tail-cache.ts`): per-file byte offset + parsed lines in a module-level cache; polls read only appended bytes and re-read fully on shrink/replacement. Bounded by `MAX_CACHED_SESSION_BYTES` (256 MiB, LRU eviction by last poll).
+- Tmux pane-existence checks are TTL-cached (`TMUX_PANE_CHECK_TTL_MS` = 5 s in `src/subagent/tmux.ts`) so the 1 s / 10 s polls stop blocking the main thread on `execFileSync` per task; decision-critical callers (steer, restore, failure diagnostics) force a fresh check.
+- The run store prunes terminal runs lazily on write when the store exceeds `RUN_STORE_MAX_RUNS` (1,000): terminal runs older than `RUN_STORE_RETENTION_MS` (7 days) are dropped first, then the oldest prunable terminal runs down to the cap. Runs with an unexpired lease or a pending durable decision are never pruned.
+- Orchestration journal rotation keeps at most `MAX_ROTATED_SEGMENTS` (10) rotated 4 MiB segments — the oldest are deleted on rotation, and readers load only live + the newest 10 (a replay cursor whose window was deleted fails with "journal was truncated").
+
 ## Scheduling and RPC
 
 Schedules persist before Cron installation, use protected non-overlapping callbacks, and remove their own schedule field before invocation to prevent recursion. RPC protocol v3 creates opaque recursive scopes, freezes scopes before cancellation, stops descendants first, and reports unsettled/failure details instead of returning optimistic success.

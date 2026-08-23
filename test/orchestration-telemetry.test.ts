@@ -5,9 +5,12 @@ import { tmpdir } from "node:os";
 import {
   appendOrchestrationEvent,
   deriveOrchestrationMetrics,
+  MAX_ROTATED_SEGMENTS,
+  MAX_SEGMENT_BYTES,
   readOrchestrationEvents,
   summarizeTaskSessionUsage,
 } from "../src/orchestration/telemetry.ts";
+import { readdir } from "node:fs/promises";
 
 const temporaryDirectories: string[] = [];
 
@@ -346,5 +349,111 @@ describe("task outcome telemetry", () => {
     );
     expect(clampedEvent?.reason).toHaveLength(1_024);
     expect(clampedEvent?.reason).not.toContain("super-secret");
+  });
+});
+
+describe("journal rotation retention", () => {
+  function eventLine(sequence: number, marker: string): string {
+    return JSON.stringify({
+      version: 1,
+      id: `event-${sequence}`,
+      type: "task_started",
+      orchestrationId: "orch-retention",
+      timestamp: new Date().toISOString(),
+      sequence,
+      ...(marker ? { taskId: marker } : {}),
+    });
+  }
+
+  function rotatedPath(eventPath: string, generation: number): string {
+    return `events.${generation}.jsonl`;
+  }
+
+  async function rotatedGenerations(directory: string): Promise<number[]> {
+    const entries = await readdir(directory);
+    return entries
+      .filter((name) => /^events\.\d+\.jsonl$/u.test(name))
+      .map((name) => Number(name.match(/^events\.(\d+)\.jsonl$/u)![1]))
+      .sort((a, b) => a - b);
+  }
+
+  it("deletes rotated segments past the cap when the journal rotates", async () => {
+    const directory = await createTemporaryDirectory();
+    const eventPath = join(directory, "events.jsonl");
+
+    // Twelve pre-existing rotated segments: older than the retention cap.
+    for (let generation = 1; generation <= 12; generation += 1) {
+      await writeFile(
+        join(directory, rotatedPath(eventPath, generation)),
+        `${eventLine(generation, `task-gen-${generation}`)}\n`,
+        "utf8",
+      );
+    }
+
+    // A live segment that crosses the rotation threshold on the next append,
+    // with a valid sidecar index so no rebuild is needed.
+    const liveLines: string[] = [];
+    let liveBytes = 0;
+    let sequence = 100;
+    while (liveBytes < MAX_SEGMENT_BYTES) {
+      const line = eventLine(sequence, `task-live-${sequence}`);
+      liveLines.push(line);
+      liveBytes += Buffer.byteLength(line, "utf8") + 1; // + the joining newline
+      sequence += 1;
+    }
+    const live = `${liveLines.join("\n")}\n`;
+    await writeFile(eventPath, live, "utf8");
+    await writeFile(
+      `${eventPath}.index.json`,
+      `${JSON.stringify({
+        version: 1,
+        generation: 13,
+        lastSequence: sequence - 1,
+        bytes: Buffer.byteLength(live, "utf8"),
+        keyed: {},
+      })}\n`,
+      "utf8",
+    );
+
+    const appended = await appendOrchestrationEvent({
+      eventPath,
+      event: { type: "task_completed", orchestrationId: "orch-retention", taskId: "task-rotate" },
+    });
+    expect(appended.sequence).toBe(sequence);
+
+    // The live segment rotated into generation 13; the oldest segments were
+    // deleted so at most MAX_ROTATED_SEGMENTS remain.
+    const generations = await rotatedGenerations(directory);
+    expect(generations[0]).toBe(4);
+    expect(generations.at(-1)).toBe(13);
+    expect(generations.length).toBe(MAX_ROTATED_SEGMENTS);
+  });
+
+  it("reads only live + the newest rotated segments on legacy journals", async () => {
+    const directory = await createTemporaryDirectory();
+    const eventPath = join(directory, "events.jsonl");
+
+    // Fifteen rotated segments: more than the cap a legacy install may have.
+    for (let generation = 1; generation <= 15; generation += 1) {
+      await writeFile(
+        join(directory, rotatedPath(eventPath, generation)),
+        `${eventLine(generation * 1_000, `task-gen-${generation}`)}\n`,
+        "utf8",
+      );
+    }
+    await writeFile(eventPath, `${eventLine(99_999, "task-live")}\n`, "utf8");
+
+    const events = await readOrchestrationEvents(eventPath);
+    const markers = events
+      .map((event) => event.taskId)
+      .filter((taskId): taskId is string => taskId !== undefined);
+
+    // Segments 1-5 were never loaded: only generations 6-15 + live are read.
+    expect(markers).not.toContain("task-gen-1");
+    expect(markers).not.toContain("task-gen-5");
+    expect(markers).toContain("task-gen-6");
+    expect(markers).toContain("task-gen-15");
+    expect(markers).toContain("task-live");
+    expect(events.length).toBe(MAX_ROTATED_SEGMENTS + 1);
   });
 });

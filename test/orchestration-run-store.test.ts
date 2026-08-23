@@ -10,6 +10,9 @@ import {
   listDurableRuns,
   patchDurableRun,
   putDurableRun,
+  RUN_STORE_MAX_RUNS,
+  RUN_STORE_RETENTION_MS,
+  type DurableTaskRun,
 } from "../src/orchestration/run-store.ts";
 import { taggedDigest } from "../src/learning-contract.ts";
 
@@ -181,5 +184,136 @@ describe("durable task run store", () => {
     const [loaded] = await listDurableRuns(path);
     expect(loaded).toBeDefined();
     expect("semanticBindingKey" in (loaded as object)).toBe(false);
+  });
+});
+
+describe("run store retention", () => {
+  const daysAgo = (days: number) =>
+    new Date(Date.now() - days * 24 * 60 * 60 * 1_000).toISOString();
+
+  async function writeStore(
+    path: string,
+    runs: DurableTaskRun[],
+  ): Promise<void> {
+    await writeFile(path, JSON.stringify({ version: 1, runs }), "utf8");
+  }
+
+  function terminalRun(directory: string, invocationId: string, updatedAt: string): DurableTaskRun {
+    const run = createDurableRun({ invocationId, projectDirectory: directory });
+    run.executionPhase = "completed";
+    run.updatedAt = updatedAt;
+    return run;
+  }
+
+  it("prunes terminal runs past retention when the store exceeds the cap, lazily on write", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-runs-prune-"));
+    directories.push(directory);
+    const path = join(directory, "runs.json");
+
+    const runs: DurableTaskRun[] = [];
+    for (let i = 0; i < RUN_STORE_MAX_RUNS; i += 1) {
+      runs.push(terminalRun(directory, `old-${i}`, daysAgo(8))); // past the 7-day retention
+    }
+    for (let i = 0; i < 10; i += 1) {
+      runs.push(terminalRun(directory, `fresh-${i}`, daysAgo(1)));
+    }
+    runs.push(createDurableRun({ invocationId: "active-working", projectDirectory: directory }));
+    runs.push(createDurableRun({ invocationId: "active-blocked", projectDirectory: directory }));
+    await writeStore(path, runs);
+
+    // Under the cap nothing is pruned, even with stale terminal runs present.
+    const small = await listDurableRuns(path);
+    expect(small).toHaveLength(runs.length);
+
+    const trigger = createDurableRun({ invocationId: "new-arrival", projectDirectory: directory });
+    await putDurableRun(path, trigger);
+
+    const loaded = await listDurableRuns(path);
+    const ids = new Set(loaded.map((run) => run.invocationId));
+    // The past-retention terminal runs were shed; the store is back under the
+    // cap with the fresh terminal, active, and triggering runs intact.
+    expect(loaded.length).toBeLessThanOrEqual(RUN_STORE_MAX_RUNS);
+    expect(loaded.length).toBe(13);
+    expect(ids.has("new-arrival")).toBe(true);
+    expect(ids.has("active-working")).toBe(true);
+    expect(ids.has("active-blocked")).toBe(true);
+    expect(ids.has("fresh-0")).toBe(true);
+    expect(ids.has("old-0")).toBe(false);
+    expect(ids.has("old-999")).toBe(false);
+  });
+
+  it("sheds the oldest terminal runs when retention alone cannot get under the cap", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-runs-prune-cap-"));
+    directories.push(directory);
+    const path = join(directory, "runs.json");
+
+    const runs: DurableTaskRun[] = [];
+    const base = Date.now() - 24 * 60 * 60 * 1_000; // 1 day ago: within retention
+    for (let i = 0; i < RUN_STORE_MAX_RUNS + 5; i += 1) {
+      // All within retention; oldest-first updatedAt so the cap sheds `young-*`.
+      runs.push(terminalRun(directory, `young-${i}`, new Date(base + i).toISOString()));
+    }
+    await writeStore(path, runs);
+
+    const trigger = createDurableRun({ invocationId: "cap-trigger", projectDirectory: directory });
+    await putDurableRun(path, trigger);
+
+    const loaded = await listDurableRuns(path);
+    const ids = new Set(loaded.map((run) => run.invocationId));
+    expect(loaded.length).toBeLessThanOrEqual(RUN_STORE_MAX_RUNS);
+    expect(ids.has("cap-trigger")).toBe(true);
+    // The five oldest terminal runs were shed to get under the cap.
+    expect(ids.has("young-0")).toBe(false);
+    expect(ids.has(`young-${RUN_STORE_MAX_RUNS - 1}`)).toBe(true);
+  });
+
+  it("never prunes runs with an active lease or a pending durable decision", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-runs-prune-hold-"));
+    directories.push(directory);
+    const path = join(directory, "runs.json");
+
+    const leased = terminalRun(directory, "terminal-leased", daysAgo(30));
+    leased.lease = {
+      id: "lease-1",
+      owner: "task-leased",
+      claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+      acquiredAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
+      fence: 1,
+    };
+
+    const deciding = terminalRun(directory, "terminal-deciding", daysAgo(30));
+    deciding.decisionRequest = {
+      id: "decision-1",
+      question: "Which direction?",
+      options: [
+        { id: "a", label: "A" },
+        { id: "b", label: "B" },
+      ],
+      requestedAt: new Date().toISOString(),
+      requestDigest: `sha256:v1:${"ab".repeat(32)}`,
+      status: "pending",
+    };
+
+    const runs: DurableTaskRun[] = [];
+    for (let i = 0; i < RUN_STORE_MAX_RUNS; i += 1) {
+      runs.push(terminalRun(directory, `old-${i}`, daysAgo(8)));
+    }
+    runs.push(leased, deciding);
+    await writeStore(path, runs);
+
+    const trigger = createDurableRun({ invocationId: "hold-trigger", projectDirectory: directory });
+    await putDurableRun(path, trigger);
+
+    const ids = new Set((await listDurableRuns(path)).map((run) => run.invocationId));
+    expect(ids.has("terminal-leased")).toBe(true);
+    expect(ids.has("terminal-deciding")).toBe(true);
+    expect(ids.has("hold-trigger")).toBe(true);
+    expect(ids.has("old-0")).toBe(false);
+  });
+
+  it("retention window and cap are the documented constants", () => {
+    expect(RUN_STORE_RETENTION_MS).toBe(7 * 24 * 60 * 60 * 1_000);
+    expect(RUN_STORE_MAX_RUNS).toBe(1_000);
   });
 });

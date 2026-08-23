@@ -51,7 +51,8 @@ export function enrichSubagentFailureMessage(input: {
   }
 
   if (input.paneId) {
-    const dead = paneDead(input.paneId);
+    // Fresh check: a failure report must not show a TTL-cached "alive".
+    const dead = paneDead(input.paneId, { fresh: true });
     lines.push(`Tmux pane ${input.paneId}: ${dead ? "dead" : "still alive"}`);
     if (dead) {
       lines.push("", "Last lines from subagent pane:", "---", sanitizePaneCapture(capturePaneTail(input.paneId, 120)), "---");
