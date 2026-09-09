@@ -75,7 +75,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.0",
     "@earendil-works/pi-tui": "0.84.0",
-    "@minhduydev/pi-core": "file:../pi-core",
+    "@minhduydev/pi-core": "^0.3.1",
     "@types/node": "^20.0.0",
     "tsx": "^4.20.6",
     "typebox": "1.3.7",
