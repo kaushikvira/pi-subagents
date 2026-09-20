@@ -52,16 +52,18 @@ test("terminal subagents defer to Pi unless an agent explicitly selects a model"
   );
 });
 
-test("SDK subagents use the current Pi model when their agent has no model", async () => {
+test("SDK subagents fall back to the first available model (global default) when nothing is pinned", async () => {
   const current = { id: "gpt-5", provider: { id: "openai" } };
-  const fallback = { id: "other", provider: { id: "other" } };
+  const globalDefault = { id: "other", provider: { id: "other" } };
 
+  // 9b24061: subagents no longer inherit the parent session's model;
+  // with no requested/pinned model they use Pi's global default (first available).
   const resolved = await resolveSdkModel({
     model: current,
-    modelRegistry: { getAll: () => [fallback] },
+    modelRegistry: { getAll: () => [globalDefault] },
   });
 
-  assert.equal(resolved, current);
+  assert.equal(resolved, globalDefault);
 });
 
 test("SDK subagents preserve an explicitly configured agent model", async () => {
