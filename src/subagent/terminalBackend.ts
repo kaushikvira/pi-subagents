@@ -19,6 +19,8 @@ export type TerminalHandle =
       parentPaneId?: string;
       agentName?: string;
       tabId?: string;
+      /** This launch created and exclusively owns `tabId`; close it on teardown. */
+      ownsTab?: boolean;
       workspaceId?: string;
       workspaceGroup?: string;
       herdrLayout?: HerdrLayout;

@@ -751,6 +751,8 @@ export function createHerdrTerminalBackend(
           : undefined;
         let created: HerdrPane | undefined;
         let expectedAgent: HerdrAgentInfo | undefined;
+        let ownsTab = false;
+        let createdTabId: string | undefined;
         try {
           if (workspace) {
             const response = await runWithRetry(
@@ -759,6 +761,42 @@ export function createHerdrTerminalBackend(
               { label: "pane get", signal: input.signal },
             );
             created = paneFrom(decode(response.stdout, "pane get"));
+          } else if (groupKey === undefined) {
+            // Default (no workspace group): open a new tab in the parent's own
+            // workspace instead of splitting whatever pane is focused. Same
+            // workspace, new tab — deterministic regardless of current focus.
+            let parentWorkspaceId: string | undefined;
+            try {
+              const parentPane = await runWithRetry(
+                launchRun,
+                ["pane", "get", env.HERDR_PANE_ID],
+                { label: "pane get parent", signal: input.signal },
+              );
+              const parentPayload = decode<{ pane?: { workspace_id?: string } }>(
+                parentPane.stdout,
+                "pane get",
+              );
+              parentWorkspaceId = parentPayload.pane?.workspace_id;
+            } catch {
+              // If the parent pane's workspace can't be resolved, fall back to
+              // the current workspace (tab create without --workspace).
+            }
+            const response = await runWithRetry(
+              launchRun,
+              [
+                "tab",
+                "create",
+                ...(parentWorkspaceId ? ["--workspace", parentWorkspaceId] : []),
+                "--cwd",
+                input.cwd,
+                ...terminalEnvArgs,
+                "--no-focus",
+              ],
+              { label: "tab create", signal: input.signal },
+            );
+            created = paneFrom(decode(response.stdout, "tab create"));
+            createdTabId = created.tab_id;
+            ownsTab = true;
           } else {
             const panes = existingGroup ? [...existingGroup.paneIds] : [];
             const gridSplit = panes.length > 0
@@ -847,6 +885,7 @@ export function createHerdrTerminalBackend(
             if (input.signal?.aborted) throw error;
             // Metadata is observability-only after the owned Pi agent is live.
           }
+          const handleTabId = createdTabId ?? created.tab_id;
           return {
             backend: "herdr" as const,
             resourceId: created.pane_id,
@@ -854,7 +893,8 @@ export function createHerdrTerminalBackend(
             terminalId: created.terminal_id,
             parentPaneId: env.HERDR_PANE_ID,
             agentName: input.label ?? "pi-task",
-            ...(created.tab_id ? { tabId: created.tab_id } : {}),
+            ...(handleTabId ? { tabId: handleTabId } : {}),
+            ...(ownsTab ? { ownsTab: true } : {}),
             ...((workspace?.workspace_id ?? existingGroup?.workspaceId)
               ? { workspaceId: workspace?.workspace_id ?? existingGroup?.workspaceId }
               : {}),
@@ -960,6 +1000,10 @@ export function createHerdrTerminalBackend(
           } else if (handle.workspaceId) {
             await run(["workspace", "close", handle.workspaceId]);
           }
+          return;
+        }
+        if (handle.backend === "herdr" && handle.ownsTab && handle.tabId) {
+          await run(["tab", "close", handle.tabId]);
           return;
         }
         if (handle.backend === "herdr" && handle.workspaceId) {

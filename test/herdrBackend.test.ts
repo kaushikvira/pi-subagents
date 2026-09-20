@@ -343,10 +343,27 @@ test("ungrouped HerdR launch splits the caller pane before starting Pi", async (
     },
     run: async (_command, args) => {
       calls.push([...args]);
-      if (args[1] === "split") {
+      if (args[1] === "get") {
         return {
           stdout: JSON.stringify({
-            pane: { pane_id: "w1:p2", terminal_id: "term-2" },
+            pane: {
+              pane_id: "w1:p1",
+              terminal_id: "term-1",
+              workspace_id: "ws-1",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[1] === "create") {
+        return {
+          stdout: JSON.stringify({
+            pane: {
+              pane_id: "w1:p2",
+              terminal_id: "term-2",
+              tab_id: "tab-2",
+              workspace_id: "ws-1",
+            },
           }),
           stderr: "",
         };
@@ -375,14 +392,16 @@ test("ungrouped HerdR launch splits the caller pane before starting Pi", async (
     terminalId: "term-2",
     parentPaneId: "w1:p1",
     agentName: "pi-task",
+    tabId: "tab-2",
+    ownsTab: true,
   });
-  assert.deepEqual(calls.slice(0, 2), [
+  assert.deepEqual(calls.slice(0, 3), [
+    ["pane", "get", "w1:p1"],
     [
-      "pane",
-      "split",
-      "--current",
-      "--direction",
-      "right",
+      "tab",
+      "create",
+      "--workspace",
+      "ws-1",
       "--cwd",
       "/repo",
       "--no-focus",
@@ -400,7 +419,7 @@ test("ungrouped HerdR launch splits the caller pane before starting Pi", async (
       "task",
     ],
   ]);
-  assert.deepEqual(calls[2]?.slice(0, 3), [
+  assert.deepEqual(calls[3]?.slice(0, 3), [
     "pane",
     "report-metadata",
     "w1:p2",
