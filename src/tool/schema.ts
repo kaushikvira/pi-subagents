@@ -2,9 +2,10 @@ import { Type } from "typebox";
 
 export function taskParametersSchema() {
   return Type.Object({
-    agent_type: Type.String({
-      description: "The type of specialist agent to use for this task",
-    }),
+    agent_type: Type.Optional(Type.String({
+      description:
+        'The type of specialist agent to use for this task. Defaults to "coder" when omitted.',
+    })),
     prompt: Type.String({
       description:
         "The complete task for the agent to perform. Self-contained about context, not pre-solved about solution. State the governed outcome (observable behavior, not an implementation), the frontier the agent owns deciding, locked decisions (each with rationale and an unlock condition), acceptance (what evidence would convince a skeptic), non-goals, and write/read policy.",

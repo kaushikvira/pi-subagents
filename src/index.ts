@@ -126,6 +126,8 @@ const BUNDLED_AGENT_DIR = join(
   "..",
   "agents",
 );
+// Fallback agent when the task tool is invoked without an explicit agent_type.
+const DEFAULT_TASK_AGENT = "coder";
 // Conversation helpers live in ./conversation.js.
 
 // ─── Extension Entry Point ──────────────────────────────────────────────────
@@ -271,7 +273,10 @@ export default function (pi: ExtensionAPI) {
         .getAllTools()
         .map((tool) => tool.name)
         .filter(Boolean);
-      const preflight = resolveTaskAgentPreflight(agents, params.agent_type);
+      const preflight = resolveTaskAgentPreflight(
+        agents,
+        params.agent_type?.trim() ? params.agent_type : DEFAULT_TASK_AGENT,
+      );
       if (!preflight.ok) {
         return {
           content: [
