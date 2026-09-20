@@ -31,9 +31,10 @@ export async function resolveSdkModel(
       const exact = registry.find(provider, modelId);
       if (exact) return exact;
     }
-  } else if (ctx.model) {
-    return ctx.model;
   }
+  // MODIFIED: Subagents use Pi's global defaults, not the parent session's current model.
+  // This gives subagents independence from temporary parent model switches.
+  // Removed: } else if (ctx.model) { return ctx.model; }
 
   const all = registry.getAll();
   const available = all.length > 0 ? all : registry.getAvailable();
@@ -47,6 +48,7 @@ export async function resolveSdkModel(
     if (byId) return byId;
     throw new Error(`Requested subagent model "${requested}" is not available`);
   }
+  // Returns the first available model (Pi's default configuration order)
   return available[0];
 }
 
