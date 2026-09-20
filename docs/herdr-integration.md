@@ -11,7 +11,7 @@
 ## Launch sequence
 
 1. Validate Herdr environment and control plane.
-2. Create/split an owned pane or grouped workspace with `--no-focus`.
+2. Open a placement with `--no-focus`: a **new tab** in the current workspace (default, no `workspace_group`), or create/split a grouped workspace.
 3. Start a unique Pi agent with `herdr agent start ... --kind pi --pane ... -- <argv>`.
 4. Submit the task with atomic `herdr agent prompt`.
 5. Report `task_id`, `task_phase`, `task_agent`, and `task_parent` metadata from source `pi-subagents`.
@@ -33,7 +33,7 @@
 
 ## Grouping
 
-Groups are namespaced by socket, parent pane, group label, and layout mode. By default, the first task creates an owned workspace root. One task fills it, two are side-by-side, three use one full-height column and two half-height panes, and four form a 2x2 grid. Additional tasks recursively split the largest remaining cell. Persisted handles retain workspace ownership for restoration and cleanup.
+Groups are namespaced by socket, parent pane, group label, and layout mode. **Without** `workspace_group`, a task opens a new tab in the current workspace (no owned workspace). **With** `workspace_group` (dedicated mode), the first task creates an owned workspace root. One task fills it, two are side-by-side, three use one full-height column and two half-height panes, and four form a 2x2 grid. Additional tasks recursively split the largest remaining cell. Persisted handles retain workspace ownership for restoration and cleanup.
 
 Set `herdr_layout: "attached"` together with `workspace_group` to keep the current parent pane as the left 50% and grid children within the right 50%. The first child is a right split from the parent at ratio `0.5`; later children split only child panes. Attached handles never own the parent workspace, so intermediate and final cleanup close child panes only. Tmux and SDK execution accept but ignore this HerdR-specific option.
 

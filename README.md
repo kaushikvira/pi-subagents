@@ -73,7 +73,7 @@ Core parameters:
 
 | Field | Meaning |
 |---|---|
-| `agent_type` | consumer profile name |
+| `agent_type` | consumer profile name; optional, defaults to `coder` |
 | `description` | short task title |
 | `prompt` | governed-outcome brief: self-contained about context, not pre-solved about solution |
 | `background` | defaults to `true`; `false` waits foreground |
@@ -84,6 +84,8 @@ Core parameters:
 | `herdr_layout: "attached"` | keep the HerdR parent left 50% and grid grouped children in the right 50% |
 | `isolation: "worktree"` | run in a dedicated Git worktree |
 | `orchestration` | optional durable coordination and verification |
+
+A plain `task` (no `workspace_group`) in Herdr opens a **new tab** in the current workspace — it does not create a new workspace. Set `workspace_group` to get a dedicated, owned workspace.
 
 ### Prompt contract (governed outcome)
 
