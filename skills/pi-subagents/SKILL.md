@@ -70,6 +70,21 @@ Do not hand the agent a verification recipe, a chosen architecture, or pre-named
 
 Write claims must be exclusive and project-relative. Claims coordinate ownership; worktrees provide write isolation. The source repository must be clean before worktree launch. After gates pass, use `task_control` `worktree_status` and `worktree_merge`; use `worktree_remove` only to explicitly discard retained changes.
 
+### Model selection
+
+Subagents do not inherit the parent session's model. Effective model precedence:
+
+1. Launch `model` param — fully-qualified `provider/model-id` (e.g. `"minimax/MiniMax-M3"`); overrides everything for that task
+2. `subagents.defaultModel` in pi `settings.json` (project `.pi/settings.json` overrides global `~/.pi/agent/settings.json`)
+3. Agent profile's pinned `model:` frontmatter
+4. Pi's global default model (first available in the registry)
+
+```json
+{ "agent_type": "coder", "model": "minimax/MiniMax-M3", "description": "Long-context refactor", "prompt": "..." }
+```
+
+Omit `model` to use the configured default. `model` is ignored when resuming via `task_id` — a resumed task keeps its session's model. The task widget shows the effective model next to the agent type (e.g. `- coder · vllm-rtx5090/Qwen3.8-27B · mu95hy8k · 12m 18s · 70 tools`).
+
 ## Read the result
 
 The child reports `<status>success | failure | blocked | partial | reframed</status>`. Treat `reframed` as a valid outcome, not a failure: the delegated framing was wrong and the agent delivered the corrected framing — read summary/findings for the reframe. An optional `<needs_decision>` field carries a disputed premise or a decision only you can make (options with tradeoffs); resolve it before relaunching or steering.
