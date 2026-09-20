@@ -5,15 +5,16 @@ the Herdr backend is active; the tmux/SDK fallbacks ignore pane placement entire
 
 ## Pane and workspace placement by task shape
 
-Pick placement by task shape, not habit. Foreground splits preserve focus (`--no-focus`), so they
-open without stealing the cursor.
+Pick placement by task shape, not habit. The default (no `workspace_group`) launch opens a **new
+tab** in the parent's own workspace; grouped/attached layouts split panes. All placement uses
+`--no-focus`, so nothing steals the cursor.
 
 | Situation | Mode | Where it appears |
 |---|---|---|
 | trivial single-file edit, direct Q&A, one known file | inline — no `task` | parent pane |
-| 1-3 quick parallel reads / explore / research | foreground, shared cwd | foreground split in the current workspace (visible, easy to watch) |
+| 1-3 quick parallel reads / explore / research | foreground, shared cwd | a new tab in the current workspace (visible, easy to watch; doesn't consume split space) |
 | a coherent batch of related tasks (audit N files; implement + review + proof-audit; parallel writers on different areas) | one `workspace_group` label + same `batch_id`, `join: "group"` | first task opens an owned workspace root; later same-group tasks stack downward (parent workspace stays clean) |
-| fire-and-forget, past the split limit, or reducing visual noise | `background: true` | queues; no immediate pane; recovers from a split race |
+| fire-and-forget, or reducing visual noise | `background: true` | queues; no immediate pane; recovers from a placement race |
 | any parallel or sensitive writer | `isolation: "worktree"` + exclusive `claims` | separate workspace + separate git checkout (physical isolation, clean review) |
 
 ## The pane-race fix is structural, not just batching

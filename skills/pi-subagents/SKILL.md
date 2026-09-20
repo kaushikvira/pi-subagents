@@ -22,6 +22,8 @@ Use the `task` tool for delegation. Agent profiles belong to the consumer's `.pi
 
 ## Delegate
 
+`agent_type` is optional — omit it to default to `coder`; an explicit value still routes to that specialist.
+
 Write the prompt as a governed outcome, not a recipe:
 
 - Outcome: the governed outcome, stated as observable behavior — not an implementation.
