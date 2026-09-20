@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { buildPiArgs, type AgentConfig } from "../src/helpers.js";
+import { buildPiArgv } from "../src/subagent/buildArgv.js";
+import { loadSubagentSettings } from "../src/subagent-settings.js";
 import { resolveSdkModel } from "../src/subagent/runSdk.js";
 
 const bundledAgentDir = fileURLToPath(new URL("../agents/", import.meta.url));
@@ -78,6 +82,62 @@ test("SDK subagents preserve an explicitly configured agent model", async () => 
   );
 
   assert.equal(resolved, configured);
+});
+
+test("buildPiArgv model override wins over the agent profile pin", () => {
+  const agent: AgentConfig = {
+    name: "test",
+    description: "test agent",
+    body: "",
+    source: "bundled",
+    path: "/agents/test.md",
+    model: "anthropic/claude-sonnet",
+  };
+
+  const args = buildPiArgv({
+    agent,
+    sessionName: "t",
+    sessionDir: "/tmp",
+    promptContent: "p",
+    model: "minimax/MiniMax-M3",
+  });
+  assert.deepEqual(
+    args.slice(args.indexOf("--model"), args.indexOf("--model") + 2),
+    ["--model", "minimax/MiniMax-M3"],
+  );
+});
+
+test("loadSubagentSettings: global default, project override, no key", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-subagents-home-"));
+  const globalSettings = join(home, ".pi", "agent", "settings.json");
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeFileSync(globalSettings, JSON.stringify({ subagents: { defaultModel: "global/model" } }));
+
+  const project = mkdtempSync(join(tmpdir(), "pi-subagents-proj-"));
+  const outer = join(project, "src");
+  mkdirSync(join(project, ".pi"), { recursive: true });
+  mkdirSync(outer, { recursive: true });
+
+  const originalHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    // global only
+    assert.deepEqual(loadSubagentSettings(project), { defaultModel: "global/model" });
+
+    // project overrides global
+    writeFileSync(
+      join(project, ".pi", "settings.json"),
+      JSON.stringify({ subagents: { defaultModel: "project/model" } }),
+    );
+    assert.deepEqual(loadSubagentSettings(outer), { defaultModel: "project/model" });
+
+    // no subagents key anywhere -> empty
+    rmSync(join(project, ".pi"), { recursive: true });
+    writeFileSync(globalSettings, JSON.stringify({}));
+    assert.deepEqual(loadSubagentSettings(outer), {});
+  } finally {
+    process.env.HOME = originalHome;
+  }
 });
 
 test("SDK subagents fail clearly when a pinned model is unavailable", async () => {

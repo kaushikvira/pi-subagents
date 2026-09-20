@@ -746,6 +746,7 @@ export function formatAgentList(agents: AgentConfig[]): string {
       taskToolName?: string,
       resumeSessionRef?: string,
       promptLaunch?: PiPromptLaunchOptions,
+      modelOverride?: string,
     ): string[] {
       return buildPiArgv({
         agent,
@@ -757,6 +758,7 @@ export function formatAgentList(agents: AgentConfig[]): string {
         parentToolNames,
         taskToolName,
         promptLaunch,
+        model: modelOverride,
       });
     }
 

@@ -164,6 +164,7 @@ export function restoreActiveBackgroundTasks(
       toolUses: 0,
       turns: 0,
       conversationId: entry.conversationId,
+      model: entry.model,
       worktree: entry.worktree,
       worktreeResult: entry.worktreeResult,
       recentCalls: [],

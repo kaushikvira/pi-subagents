@@ -22,6 +22,8 @@ export interface BackgroundTask {
   startedAt: number;
   toolUses: number;
   turns: number;
+  /** Effective model for this run (launch override or profile pin), if pinned. */
+  model?: string;
   conversationId?: string;
   worktree?: WorktreeHandle;
   worktreeResult?: WorktreeResult;
@@ -51,6 +53,8 @@ export interface RegistryEntry {
   dir: string;
   /** Durable base execution directory used by the child. */
   cwd?: string;
+  /** Effective model for this run, if pinned (launch override or profile pin). */
+  model?: string;
   conversationId?: string;
   sessionRef?: string;
   worktree?: WorktreeHandle;

@@ -20,6 +20,8 @@ export interface BuildPiArgvOptions {
   parentToolNames?: string[];
   taskToolName?: string;
   promptLaunch?: PiPromptLaunchOptions;
+  /** Fully-qualified model override (provider/model-id); wins over agent.model. */
+  model?: string;
 }
 
 export function buildPiArgv(opts: BuildPiArgvOptions): string[] {
@@ -37,7 +39,8 @@ export function buildPiArgv(opts: BuildPiArgvOptions): string[] {
   if (process.env.PI_TASK_CHILD_NO_EXTENSIONS === "1") {
     args.push("--no-extensions");
   }
-  if (agent.model) args.push("--model", agent.model);
+  const model = opts.model ?? agent.model;
+  if (model) args.push("--model", model);
   if (agent.thinking) args.push("--thinking", agent.thinking);
   args.push("--tools", allowedTools.join(","));
   args.push("--name", sessionName);

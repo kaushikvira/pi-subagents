@@ -73,6 +73,7 @@ import {
   type ChildClaimGuardConfig,
 } from "./orchestration/runtime.js";
 import { formatSdkBackgroundReceipt, startSdkBackgroundTask } from "./subagent/sdkBackground.js";
+import { loadSubagentSettings } from "./subagent-settings.js";
 import { runSdkSubagent } from "./subagent/runSdk.js";
 import {
   createDefaultHerdrTerminalBackend,
@@ -255,6 +256,7 @@ export default function (pi: ExtensionAPI) {
       "Launch multiple agents concurrently by making multiple tool calls in a single message",
       "Do NOT duplicate work you've delegated — wait for the result or work on non-overlapping tasks",
       "Use agent_type to route to the right specialist",
+      "Optionally set the launch model via the model param (provider/model-id); it overrides the profile pin and subagents.defaultModel setting",
       "Tell the agent whether to write code or just research",
       "For background tasks: DO NOT sleep, poll, or check on progress. You'll be notified",
       "After delegated work completes, read changed files, review diff, verify scope, and run relevant checks",
@@ -768,6 +770,13 @@ export default function (pi: ExtensionAPI) {
         };
         await writeFile(promptLaunch.systemPromptPath, agent.body, "utf8");
       }
+      // Model precedence: explicit launch param > subagents.defaultModel setting
+      // (fresh launches only — resuming keeps the resumed session's model)
+      // > agent profile pin > session model.
+      const subagentSettings = loadSubagentSettings(ctx.cwd);
+      const modelOverride = resume
+        ? params.model
+        : params.model ?? subagentSettings.defaultModel;
       const piArgs = buildPiArgs(
         agent,
         sessionName,
@@ -778,6 +787,7 @@ export default function (pi: ExtensionAPI) {
         taskToolName,
         resumeSessionRef,
         promptLaunch,
+        modelOverride,
       );
       const useSdkBackend = selectedBackend === "sdk";
 
@@ -811,7 +821,7 @@ export default function (pi: ExtensionAPI) {
           agent,
           cwd: executionCwd,
           ctx,
-          model: agent.model,
+          model: modelOverride ?? agent.model,
           thinkingLevel: agent.thinking,
           tools: toolSelection.tools,
           excludeTools: toolSelection.excludeTools,
@@ -834,6 +844,7 @@ export default function (pi: ExtensionAPI) {
             turns: 0,
             conversationId,
             worktree,
+            model: modelOverride ?? agent.model,
             recentCalls: [],
           };
 
@@ -861,6 +872,7 @@ export default function (pi: ExtensionAPI) {
                 turns: 0,
                 conversationId,
                 worktree,
+                model: modelOverride ?? agent.model,
                 recentCalls: [],
               };
               backgroundTasks.set(id, backgroundTask);
@@ -1265,6 +1277,7 @@ export default function (pi: ExtensionAPI) {
         turns: 0,
         conversationId,
         worktree,
+        model: modelOverride ?? agent.model,
         recentCalls: [],
         backend: selectedBackend,
       };
@@ -1284,6 +1297,7 @@ export default function (pi: ExtensionAPI) {
         dir: artifactsDir,
         cwd: taskCwd,
         conversationId,
+        model: bgtask.model,
         worktree,
       };
 

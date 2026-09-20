@@ -37,6 +37,12 @@ export function taskParametersSchema() {
           "Durable specialist conversation id. Reuses .pi/artifacts/task-<id>/sessions when called again.",
       }),
     ),
+    model: Type.Optional(
+      Type.String({
+        description:
+          "Override the model for this launch, as 'provider/model-id' (e.g. 'minimax/MiniMax-M3'). Falls back to subagents.defaultModel from settings, then the agent profile's pinned model, then the session model. Ignored when resuming via task_id.",
+      }),
+    ),
     __pi_subagents_invocation_id: Type.Optional(Type.String()),
     background: Type.Optional(
       Type.Boolean({

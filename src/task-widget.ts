@@ -7,6 +7,8 @@ export interface WidgetTask {
   description?: string;
   startedAt: number;
   toolUses: number;
+  /** Effective model for this run, if pinned. */
+  model?: string;
   recentCalls?: ToolCallRecord[];
 }
 
@@ -77,6 +79,9 @@ function renderForegroundTask(
     color(theme, "accent", ` ${spinner}`) +
     " " +
     color(theme, "toolTitle", agentName) +
+    (task.model
+      ? color(theme, "dim", " · ") + color(theme, "text", task.model)
+      : "") +
     color(theme, "dim", description) +
     color(theme, "dim", "  \u2022 ") +
     color(theme, "warning", elapsed) +
@@ -120,6 +125,9 @@ function renderBackgroundTask(
     truncateToWidth(
       color(theme, "dim", "- ") +
         color(theme, "toolTitle", task.agentType) +
+        (task.model
+          ? color(theme, "dim", " · ") + color(theme, "text", task.model)
+          : "") +
         color(theme, "dim", " · ") +
         color(theme, "accent", id) +
         color(theme, "dim", " · ") +
