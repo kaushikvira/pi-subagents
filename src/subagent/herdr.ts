@@ -123,8 +123,11 @@ function paneFrom(value: unknown): HerdrPane {
   const candidate = value as {
     pane?: Partial<HerdrPane>;
     agent?: Partial<HerdrPane>;
+    root_pane?: Partial<HerdrPane>;
   };
-  const pane = candidate.pane ?? candidate.agent;
+  // `pane create`/`split`/`agent` responses expose the pane under `pane` or
+  // `agent`; `tab create` (and `workspace create`) expose it under `root_pane`.
+  const pane = candidate.pane ?? candidate.agent ?? candidate.root_pane;
   if (
     typeof pane?.pane_id !== "string" ||
     typeof pane.terminal_id !== "string"

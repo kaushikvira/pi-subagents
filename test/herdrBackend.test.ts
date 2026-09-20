@@ -358,7 +358,7 @@ test("ungrouped HerdR launch splits the caller pane before starting Pi", async (
       if (args[1] === "create") {
         return {
           stdout: JSON.stringify({
-            pane: {
+            root_pane: {
               pane_id: "w1:p2",
               terminal_id: "term-2",
               tab_id: "tab-2",
