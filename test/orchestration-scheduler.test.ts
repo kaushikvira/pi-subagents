@@ -46,4 +46,31 @@ describe("durable task scheduler", () => {
     expect((await scheduler.list())[0]).toMatchObject({ runs: 1, enabled: false });
     scheduler.dispose();
   });
+
+   it("reports a failed scheduled launch through onError and keeps the schedule enabled", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-schedule-error-"));
+    cleanups.push(() => rm(directory, { recursive: true, force: true }));
+    const scheduler = new TaskScheduler(join(directory, "schedules.json"));
+    const failures: Array<{ error: unknown; name: string }> = [];
+    await scheduler.start(
+      async () => {
+        throw new Error("scheduled launch exploded");
+      },
+      (error, schedule) => {
+        failures.push({ error, name: schedule.name });
+      },
+    );
+    await scheduler.add({
+      name: "failing once",
+      projectDirectory: directory,
+      at: new Date(Date.now() + 120).toISOString(),
+      parameters: { agent_type: "general", background: true },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(failures).toHaveLength(1);
+    expect(String(failures[0]?.error)).toContain("scheduled launch exploded");
+    expect(failures[0]?.name).toBe("failing once");
+    expect((await scheduler.list())[0]).toMatchObject({ runs: 1, enabled: false });
+    scheduler.dispose();
+  });
 });

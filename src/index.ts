@@ -39,10 +39,10 @@ import {
   findJsonlSessionByName,
   normalizeConversationId,
   findTaskSessionHistory,
+  mutateRegistry,
   readRegistry,
   readTaskSessionsRegistry,
   upsertTaskSessionHistory,
-  writeRegistry,
   writeTaskSessionsRegistry,
 } from "./conversation.js";
 import {
@@ -1162,18 +1162,84 @@ export default function (pi: ExtensionAPI) {
                         const onAbort = () => stopProgress();
                         signal?.addEventListener("abort", onAbort, { once: true });
 
-            const completion = await waitForSessionTaskCompletion({
-              sessionDir,
-              sessionName,
-              paneId,
-              signal,
-              timeoutMs: TASK_TIMEOUT_MS,
-              pollMs: 1000,
-              sinceMs: startedAt,
-              resourceExists: selectedBackend === "herdr"
-                ? () => herdrBackend.isAlive(handle as Extract<TerminalHandle, { backend: "herdr" }>)
+            let completion: Awaited<ReturnType<typeof waitForSessionTaskCompletion>>;
+            try {
+              completion = await waitForSessionTaskCompletion({
+                sessionDir,
+                sessionName,
+                paneId,
+                signal,
+                timeoutMs: TASK_TIMEOUT_MS,
+                pollMs: 1000,
+                sinceMs: startedAt,
+                resourceExists: selectedBackend === "herdr"
+                  ? () => herdrBackend.isAlive(handle as Extract<TerminalHandle, { backend: "herdr" }>)
                 : undefined,
-            });
+              });
+            } catch (error) {
+              // The wait itself failed (e.g. a HerdR control-plane outage surfaces as a
+              // HerdrUnavailableError from the liveness probe). Without this handler the
+              // 1s progress interval kept polling for the rest of the session, the
+              // tracker entry stayed behind, the pane was left running with no wait
+              // attached, and the durable record stayed "running". Tear down exactly
+              // like a terminal status would.
+              stopProgress();
+              signal?.removeEventListener("abort", onAbort);
+              const message = error instanceof Error ? error.message : String(error);
+              try {
+                if (handle.backend === "herdr") await herdrBackend.close(handle);
+                else killAgentPane(paneId, originalPane);
+              } catch {
+              // Resource may already be gone; the durable failure below is authoritative.
+              }
+              let failedWorktreeResult: WorktreeResult | undefined;
+              if (worktree) {
+                try {
+                  failedWorktreeResult = finalizeTaskWorktree(worktree);
+                } catch {
+                  // Keep the worktree handle in history for manual recovery.
+                }
+              }
+              upsertTaskSessionHistory(piDir, {
+                id,
+                agentType: agent.name,
+                description: descText,
+                sessionName,
+                startedAt,
+                paneId,
+                handle,
+                piDir,
+                dir: artifactsDir,
+                cwd: taskCwd,
+                conversationId,
+                sessionRef: findJsonlSessionByName(piDir, sessionName, agent.name)?.sessionRef,
+                worktree,
+                worktreeResult: failedWorktreeResult,
+                status: "failed",
+                completedAt: Date.now(),
+                background: false,
+              });
+              foregroundTasks.delete(id);
+              clearTaskWidgetIfIdle();
+              return {
+                content: [
+                  { type: "text" as const, text: "Foreground task failed before producing a result: " + message },
+                ],
+                details: {
+                  phase: "failed" as const,
+                  execution_phase: "failed" as const,
+                  status: "unknown",
+                  reported_status: "unknown",
+                  result_valid: false,
+                  backend: selectedBackend,
+                  error: message,
+                  task_id: id,
+                  conversation_id: conversationId,
+                  worktree: failedWorktreeResult,
+                },
+                isError: true,
+              };
+            }
         stopProgress();
         signal?.removeEventListener("abort", onAbort);
         const content = completion.content;
@@ -1307,9 +1373,7 @@ export default function (pi: ExtensionAPI) {
       };
 
       // Write to JSON registry for on-load restore
-      const entries = readRegistry(piDir);
-      entries.push(entry);
-      writeRegistry(piDir, entries);
+      mutateRegistry(piDir, (entries) => [...entries, entry]);
       upsertTaskSessionHistory(piDir, {
         ...entry,
         status: "running",

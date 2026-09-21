@@ -193,6 +193,43 @@ export function migrateRegistryEntry(entry: Record<string, unknown> | RegistryEn
   return migrated as unknown as RegistryEntry;
 }
 
+/**
+ * Read, mutate, and write the task registry as one atomic, locked operation.
+ *
+ * The launch, completion, and stop paths each did their own unlocked
+ * read-modify-write (`readRegistry` -> filter/push -> `writeRegistry`). Each
+ * step is atomic on its own, but the sequence is not: a registry written by
+ * another Pi session between the read and the write is silently reverted, and
+ * the dropped entry is a background task whose pane, agent process, and
+ * worktree are never reaped by restore. Mutating under the same lock the write
+ * takes closes that window.
+ */
+export function mutateRegistry(
+  piDir: string,
+  mutate: (entries: RegistryEntry[]) => RegistryEntry[],
+): void {
+  const file = getRegistryPath(piDir);
+  ensureDir(dirname(file));
+  withFileLockSync({
+    lockPath: registryLockPath(file),
+    operation: () => {
+      const parsed = readJsonFile<unknown>(file, []);
+      const entries = Array.isArray(parsed)
+        ? parsed
+          .filter(
+          (entry): entry is Record<string, unknown> =>
+            Boolean(entry) && typeof entry === "object",
+        )
+          .map((entry) => migrateRegistryEntry(entry))
+        : [];
+      writeJsonFile(
+        file,
+        mutate(entries).map((entry) => migrateRegistryEntry(entry)),
+      );
+    },
+  });
+}
+
 export function readRegistry(piDir: string): RegistryEntry[] {
   const parsed = readJsonFile<unknown>(getRegistryPath(piDir), []);
   if (!Array.isArray(parsed)) return [];
@@ -234,7 +271,7 @@ export function upsertTaskSessionHistory(
   updateJsonFile<unknown>(getTaskSessionHistoryPath(piDir), [], (current) => {
     const entries = Array.isArray(current)
       ? (current as TaskSessionHistoryEntry[])
-      : [];
+        : [];
     const idx = entries.findIndex((existing) => existing.id === entry.id);
     if (idx >= 0) {
       entries[idx] = { ...entries[idx], ...entry };

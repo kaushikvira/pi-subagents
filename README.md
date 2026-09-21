@@ -4,16 +4,18 @@ A Herdr-native delegation runtime for [Pi](https://pi.dev): durable foreground/b
 
 **Runtime-only.** The package ships no agent profiles. Profiles remain owned by the consumer in `.pi/agents/*.md` or `~/.pi/agent/agents/*.md`. The runtime is additive and does not inject package policy into the consumer's parent system prompt. Its packaged skill is loaded only on demand through Pi's normal skill mechanism.
 
-## What's new in 0.12.0
+## What's new in 0.13.0
 
-- **First-class multi-repo execution:** `cwd` selects a canonical execution repository while durable state and agent profiles remain owned by the parent/control repository.
-- **Repo-scoped orchestration:** Context Pack references, claims, write guards, evidence and worktrees resolve against the selected repository; identical relative claims in different repositories no longer conflict.
-- **Durable launch admission:** concurrent launches for one `task_id`/`conversation_id` serialize, and an active background identity cannot be relaunched in foreground.
-- **Identity-safe HerdR prompts:** bounded lifecycle waits, verified stalled-prompt retry, and fail-closed cleanup prevent acting on a replacement agent.
+- **Machine-readable reason codes:** independent-review and lost-lease states carry bounded, redacted `OrchestrationReasonCode` values alongside the human-readable reasons.
+- **Review-bound usage receipts:** reviewed-task lifecycle events can carry canonical bounded `usageBindings` so learning consumers correlate accepted reviews with evidence-backed usage.
+- **Tighter NO_TELEMETRY:** `PI_SUBAGENTS_NO_TELEMETRY=1` omits optional usage/operational metrics while correctness, review, decision, digest, outcome, and idempotency fields stay durable.
+- **Registry read-modify-write is locked:** launch, completion, and stop mutate `task-registry.json` under the registry lock, so concurrent Pi sessions can no longer drop each other's task entries.
+- **Scheduled-launch failures are visible:** a failed cron/one-shot launch now records a durable `task_failed` event and notifies the parent instead of being swallowed by the cron runner.
+- **Foreground wait fails closed:** a foreground task whose completion wait throws (for example a HerdR control-plane outage) tears down its pane, tracker entry, and progress poller and reports a failed result.
 
 ## Requirements
 
-- Node.js 20+
+- Node.js 22.19+ (matches the package engines field)
 - Pi `0.84.x`
 - Optional: Herdr `0.7.5+` (preferred observable backend)
 - Optional: tmux
@@ -201,7 +203,7 @@ Execution, verification, and review are independent:
 ```text
 execution:    allocating → starting → working ↔ blocked → completed
                                                    └→ failed/cancelled/timeout
-verification: not-required | pending | passed | failed
+verification: not-required | pending | receipt-passed | passed | failed
 review:       not-required | awaiting | accepted | rejected
 ```
 
@@ -350,7 +352,7 @@ Exactly one of `cron` or `at` is required. Scheduled tasks always run in backgro
 | `/task-unschedule <id>` | disable schedule |
 | `/task-sessions` | durable conversation mappings |
 
-The model-facing control tool is named **`task_control`**, not `herdr`. This avoids collision with `@ogulcancelik/pi-herdr`, whose `herdr_layout`, `herdr_pane`, and `herdr_agent` tools can be installed alongside this package. Its lifecycle actions include `status`, `result`, `handoff`, `record_evidence`, `verify`, `review`, `ship`, `release`, `reap`, `doctor`, and `metrics`. Retained isolated changes are handled explicitly with `worktree_status`, `worktree_merge` (only after verification/review gates pass), or `worktree_remove`.
+The model-facing control tool is named **`task_control`**, not `herdr`. This avoids collision with `@ogulcancelik/pi-herdr`, whose `herdr_layout`, `herdr_pane`, and `herdr_agent` tools can be installed alongside this package. Its lifecycle actions include `status`, `result`, `handoff`, `record_evidence`, `verify`, `review`, `ship`, `release`, `reap`, `doctor`, `metrics`, `record_review`, and `respond` (durable decision loop). Retained isolated changes are handled explicitly with `worktree_status`, `worktree_merge` (only after verification/review gates pass), or `worktree_remove`.
 
 ## Herdr integration
 

@@ -1,9 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   findJsonlSessionByName,
-  readRegistry,
+  mutateRegistry,
   upsertTaskSessionHistory,
-  writeRegistry,
 } from "../conversation.js";
 import { assessTaskResult, parseResultXml } from "../helpers.js";
 import { createSyncHerdrControl } from "../subagent/herdr.js";
@@ -67,8 +66,7 @@ export function completeTask(
     background: true,
   });
 
-  const entries = readRegistry(piDir).filter((entry) => entry.id !== id);
-  writeRegistry(piDir, entries);
+  mutateRegistry(piDir, (entries) => entries.filter((entry) => entry.id !== id));
 
   try {
     resourceCloser(task);

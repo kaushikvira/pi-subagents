@@ -354,7 +354,7 @@ export function createTaskRuntime(
         });
       }
       await reconcileRestoredCompletions(pi, state, ctx.cwd);
-      await ensureScheduler(state, paths.scheduleStore, ctx);
+      await ensureScheduler(state, paths.scheduleStore, ctx, pi);
     });
     pi.on("session_shutdown", () => {
       if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
@@ -492,7 +492,7 @@ function createOrchestratedTaskTool(
         };
       }
       if (orchestration?.schedule) {
-        const scheduler = await ensureScheduler(state, paths.scheduleStore, ctx);
+        const scheduler = await ensureScheduler(state, paths.scheduleStore, ctx, pi);
         const scheduledParameters = structuredClone(parametersValue);
         const scheduledRecord = toRecord(scheduledParameters);
         scheduledRecord.background = true;
@@ -1629,6 +1629,7 @@ async function ensureScheduler(
   state: RuntimeState,
   storePath: string,
   ctx: ExtensionContext,
+  pi: ExtensionAPI,
 ): Promise<TaskScheduler> {
   let scheduler = state.schedulers.get(storePath);
   if (!scheduler) {
@@ -1654,7 +1655,37 @@ async function ensureScheduler(
     if (isFailedTaskResult(result)) {
       throw new Error(`Scheduled task launch failed: ${taskResultFailureReason(result)}`);
     }
-  });
+  },
+  (error, schedule) => {
+    // A scheduled launch that threw used to disappear into croner's catch-all
+    // while the schedule advanced as if it had run. Make the failure durable
+    // and visible; the schedule itself stays enabled.
+    const reason = errorMessage(error);
+    void appendOrchestrationEvent({
+      eventPath: getOrchestrationPaths(schedule.projectDirectory).eventLog,
+      event: {
+        type: "task_failed",
+        orchestrationId: "schedule-" + schedule.id,
+        reason: "Scheduled task " + JSON.stringify(schedule.name) + " failed to launch: " + reason,
+        idempotencyKey: "schedule:" + schedule.id + ":launch-failed:" + schedule.runs,
+      },
+    }).catch(() => undefined);
+    try {
+      pi.sendMessage(
+        {
+          customType: "orchestration-schedule-launch-failed",
+          content:
+            "Scheduled task failed to launch (" + schedule.name + ", " + schedule.id + "): " + reason +
+            ". The schedule stays enabled; inspect /task-schedules.",
+          display: true,
+        },
+        { triggerTurn: false },
+      );
+    } catch {
+      // The durable event above is authoritative; a stale ctx must not throw here.
+    }
+  },
+  );
   return scheduler;
 }
 

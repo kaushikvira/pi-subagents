@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readRegistry, writeRegistry } from "../conversation.js";
+import { mutateRegistry, readRegistry } from "../conversation.js";
 import { findPiDir } from "../helpers.js";
 import { createSyncHerdrControl } from "../subagent/herdr.js";
 import { steerRunningBackgroundTask } from "../subagent/steer.js";
@@ -35,9 +35,8 @@ export async function stopOwnedTask(
     cleanupError = error;
   }
   if (entry) {
-    writeRegistry(
-      piDirectory,
-      registry.filter((candidate) => candidate.id !== taskId),
+    mutateRegistry(piDirectory, (entries) =>
+      entries.filter((candidate) => candidate.id !== taskId),
     );
   }
 

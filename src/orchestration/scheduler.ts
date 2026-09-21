@@ -37,6 +37,17 @@ export interface CreateTaskScheduleInput {
   parameters: Record<string, unknown>;
 }
 
+
+/**
+ * Called when a scheduled invocation throws. Without it croner's `catch: true`
+ * silently discards the failure and the schedule keeps advancing as if the
+ * task had run.
+ */
+export type ScheduledTaskErrorHandler = (
+  error: unknown,
+  schedule: TaskSchedule,
+) => void;
+
 export type ScheduledTaskInvoker = (
   parameters: Record<string, unknown>,
   projectDirectory: string,
@@ -45,11 +56,16 @@ export type ScheduledTaskInvoker = (
 export class TaskScheduler {
   private readonly jobs = new Map<string, Cron>();
   private invoker?: ScheduledTaskInvoker;
+  private onError?: ScheduledTaskErrorHandler;
 
   constructor(private readonly storePath: string) {}
 
-  async start(invoker: ScheduledTaskInvoker): Promise<void> {
+  async start(
+    invoker: ScheduledTaskInvoker,
+    onError?: ScheduledTaskErrorHandler,
+  ): Promise<void> {
     this.invoker = invoker;
+    this.onError = onError;
     const schedules = await this.list();
     for (const schedule of schedules) {
       if (schedule.enabled) this.install(schedule);
@@ -127,6 +143,13 @@ export class TaskScheduler {
       }
       try {
         await this.invoker(structuredClone(current.parameters), current.projectDirectory);
+      } catch (error) {
+        // croner is configured with `catch: true`, which would discard a rejected
+        // callback without any trace: a scheduled launch that failed was invisible
+        // while the schedule kept advancing. Report through the handler; recordRun
+        // (in finally) still advances the schedule so one bad launch does not stall
+        // the cron.
+        this.onError?.(error, current);
       } finally {
         await this.recordRun(schedule.id, job);
       }
