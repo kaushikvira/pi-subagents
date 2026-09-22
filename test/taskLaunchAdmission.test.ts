@@ -23,6 +23,7 @@ interface TaskResult {
 }
 
 type RegisteredTask = {
+  name?: string;
   execute: (...args: unknown[]) => Promise<TaskResult>;
 };
 
@@ -36,7 +37,7 @@ function installExploreProfile(root: string): void {
 }
 
 function registerTaskTool(): { tool: RegisteredTask; shutdown: () => void } {
-  let tool: RegisteredTask | undefined;
+  const tools: RegisteredTask[] = [];
   let shutdown = () => undefined;
   const eventHandlers = new Map<string, (payload: unknown) => void>();
   taskExtension({
@@ -52,7 +53,7 @@ function registerTaskTool(): { tool: RegisteredTask; shutdown: () => void } {
     },
     registerMessageRenderer() {},
     registerTool(value: RegisteredTask) {
-      tool = value;
+      tools.push(value);
     },
     registerCommand() {},
     appendEntry() {},
@@ -60,6 +61,9 @@ function registerTaskTool(): { tool: RegisteredTask; shutdown: () => void } {
       return [];
     },
   } as never);
+  // The extension registers several tools (task, list_models, ...); the
+  // admission tests only exercise the task tool.
+  const tool = tools.find((t) => t.name === "task") ?? tools[tools.length - 1];
   assert.ok(tool);
   return { tool, shutdown };
 }

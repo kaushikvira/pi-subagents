@@ -98,6 +98,7 @@ import {
 import {
   buildTaskPrompt,
   createTaskCompleteRenderer,
+  listModelsParametersSchema,
   renderCall,
   renderResult,
   startForegroundProgressPolling,
@@ -248,6 +249,8 @@ export default function (pi: ExtensionAPI) {
 
   // ── Tool Registration ──────────────────────────────────────────────────
 
+  const registrationSettings = loadSubagentSettings(process.cwd());
+
   pi.registerTool({
     name: taskToolName,
     label: taskToolName,
@@ -258,14 +261,16 @@ export default function (pi: ExtensionAPI) {
       "Launch multiple agents concurrently by making multiple tool calls in a single message",
       "Do NOT duplicate work you've delegated — wait for the result or work on non-overlapping tasks",
       "Use agent_type to route to the right specialist",
-      "Optionally set the launch model via the model param (provider/model-id); it overrides the profile pin and subagents.defaultModel setting",
+      "Set the launch model via the model param (provider/model-id); it overrides the profile pin and subagents.defaultModel — call list_models for the available set",
       "Tell the agent whether to write code or just research",
       "For background tasks: DO NOT sleep, poll, or check on progress. You'll be notified",
       "After delegated work completes, read changed files, review diff, verify scope, and run relevant checks",
       "Send the user a concise summary of the result since the agent's output is not user-visible",
       "For repo-local search (explore/general), name an absolute repo path in the prompt when the parent cwd is not the target (e.g. pi-task extension repo vs app repo)",
         ],
-        parameters: taskParametersSchema(),
+        parameters: taskParametersSchema({
+          defaultModel: registrationSettings.defaultModel,
+        }),
 
         async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const { agents, piDir } = discoverAgents(ctx.cwd, BUNDLED_AGENT_DIR);
@@ -782,6 +787,29 @@ export default function (pi: ExtensionAPI) {
       const modelOverride = resume
         ? params.model
         : params.model ?? subagentSettings.defaultModel;
+      if (!resume && typeof params.model === "string" && params.model.trim().length > 0) {
+        const knownModels = (subagentSettings.availableModels ?? []).map(
+          (m) => m.model,
+        );
+        if (
+          knownModels.length > 0 &&
+          !knownModels.includes(params.model.trim())
+        ) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `Unknown launch model "${params.model.trim()}". Available models (subagents.availableModels):\n` +
+                  knownModels.map((m) => `- ${m}`).join("\n") +
+                  `\nDefault: ${subagentSettings.defaultModel ?? "(none set)"}\nCall list_models for the full list with descriptions.`,
+              },
+            ],
+            details: { phase: "failed" as const, error: "unknown-model" },
+            isError: true,
+          };
+        }
+      }
       const piArgs = buildPiArgs(
         agent,
         sessionName,
@@ -1441,6 +1469,53 @@ export default function (pi: ExtensionAPI) {
 
         renderCall,
         renderResult,
+  });
+
+  // Static model list for task launches — read from subagents.availableModels
+  // in pi settings (project overrides global). Registered in every session
+  // that has the task tool (parent + subagent sessions) so the model arg
+  // can always be validated against a known set.
+  pi.registerTool({
+    name: "list_models",
+    label: "list_models",
+    description:
+      "List the static set of models available for task launches (subagents.availableModels from pi settings) plus the configured default model. Use it to pick a valid value for the task tool's model argument.",
+    promptSnippet:
+      "List available launch models for the task tool (static list from settings)",
+    parameters: listModelsParametersSchema(),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const settings = loadSubagentSettings(ctx.cwd);
+      const models = settings.availableModels ?? [];
+      const lines: string[] = [];
+      if (settings.defaultModel) {
+        lines.push(`Default: ${settings.defaultModel}`);
+      }
+      if (models.length === 0) {
+        lines.push(
+          "(no models configured — add subagents.availableModels to .pi/settings.json or ~/.pi/agent/settings.json)",
+        );
+      } else {
+        lines.push(
+          "Available launch models (static list, subagents.availableModels):",
+          ...models.map(
+            (m) =>
+              m.description ? `- ${m.model} — ${m.description}` : `- ${m.model}`,
+          ),
+        );
+      }
+      lines.push(
+        "",
+        "Pass one of these (provider/model-id) as the model param when calling the task tool.",
+      );
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        details: {
+          phase: "ok" as const,
+          default_model: settings.defaultModel ?? null,
+          model_count: models.length,
+        },
+      };
+    },
   });
 
   pi.registerCommand("task-sessions", {

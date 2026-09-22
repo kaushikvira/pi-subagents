@@ -74,18 +74,22 @@ Write claims must be exclusive and project-relative. Claims coordinate ownership
 
 ### Model selection
 
-Subagents do not inherit the parent session's model. Effective model precedence:
+Subagents do not inherit the parent session's model. The `model` param is **required** on `task` for fresh launches — always pass a fully-qualified `provider/model-id`. Valid values come from the static `subagents.availableModels` list in pi `settings.json` (project `.pi/settings.json` overrides global `~/.pi/agent/settings.json`); the `list_models` tool prints that list plus the configured default. Pass the default when you have no preference.
 
-1. Launch `model` param — fully-qualified `provider/model-id` (e.g. `"minimax/MiniMax-M3"`); overrides everything for that task
-2. `subagents.defaultModel` in pi `settings.json` (project `.pi/settings.json` overrides global `~/.pi/agent/settings.json`)
+A fresh launch whose `model` is not in `subagents.availableModels` is rejected before spawn — the error lists the valid values.
+
+Effective model precedence on a fresh launch:
+
+1. Launch `model` param — fully-qualified `provider/model-id` (e.g. `"ll/Q27"`); overrides everything for that task
+2. `subagents.defaultModel` in pi `settings.json`
 3. Agent profile's pinned `model:` frontmatter
 4. Pi's global default model (first available in the registry)
 
 ```json
-{ "agent_type": "coder", "model": "minimax/MiniMax-M3", "description": "Long-context refactor", "prompt": "..." }
+{ "agent_type": "coder", "model": "ll/Q27", "description": "Long-context refactor", "prompt": "..." }
 ```
 
-Omit `model` to use the configured default. `model` is ignored when resuming via `task_id` — a resumed task keeps its session's model. The task widget shows the effective model next to the agent type (e.g. `- coder · vllm-rtx5090/Qwen3.8-27B · mu95hy8k · 12m 18s · 70 tools`).
+`model` is ignored when resuming via `task_id` — a resumed task keeps its session's model. The task widget shows the effective model next to the agent type (e.g. `- coder · ll/Q27 · mu95hy8k · 12m 18s · 70 tools`).
 
 ## Read the result
 
