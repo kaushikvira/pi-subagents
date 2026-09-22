@@ -74,19 +74,25 @@ Write claims must be exclusive and project-relative. Claims coordinate ownership
 
 ### Model selection
 
-Subagents do not inherit the parent session's model. The `model` param is **required** on `task` for fresh launches — always pass a fully-qualified `provider/model-id`. Valid values come from the static `subagents.availableModels` list in pi `settings.json` (project `.pi/settings.json` overrides global `~/.pi/agent/settings.json`); the `list_models` tool prints that list plus the configured default. Pass the default when you have no preference.
+Subagents do not inherit the parent session's model. The `model` param on `task` is **optional** — when omitted it resolves through the settings precedence below. Pass a fully-qualified `provider/model-id` for an explicit choice; valid values come from the static `subagents.availableModels` list in pi `settings.json` (project `.pi/settings.json` overrides global `~/.pi/agent/settings.json`). The `list_models` tool prints that list, the defaults, per-agent-type defaults, skipped malformed settings entries, and which settings file is in effect.
 
-A fresh launch whose `model` is not in `subagents.availableModels` is rejected before spawn — the error lists the valid values.
+A fresh launch whose explicit `model` is not in `subagents.availableModels` is rejected before spawn — the error lists the valid values.
 
 Effective model precedence on a fresh launch:
 
 1. Launch `model` param — fully-qualified `provider/model-id` (e.g. `"ll/Q27"`); overrides everything for that task
-2. `subagents.defaultModel` in pi `settings.json`
-3. Agent profile's pinned `model:` frontmatter
-4. Pi's global default model (first available in the registry)
+2. `subagents.agentModels[agent_type]` in pi `settings.json` — per-agent-type default
+3. `subagents.defaultModel` in pi `settings.json`
+4. Agent profile's pinned `model:` frontmatter
+5. Pi's global default model (first available in the registry)
 
-```json
+```jsonc
+// explicit model
 { "agent_type": "coder", "model": "ll/Q27", "description": "Long-context refactor", "prompt": "..." }
+
+// settings-driven: with settings.json "subagents": { "defaultModel": "ll/Q27",
+// "agentModels": { "coder": "ll/G5" } }, this launch resolves to ll/G5:
+{ "agent_type": "coder", "description": "Flash research", "prompt": "..." }
 ```
 
 `model` is ignored when resuming via `task_id` — a resumed task keeps its session's model. The task widget shows the effective model next to the agent type (e.g. `- coder · ll/Q27 · mu95hy8k · 12m 18s · 70 tools`).
@@ -163,7 +169,7 @@ Human commands:
 /task-sessions
 ```
 
-Model-facing `task_control` actions provide status, result, handoff, `record_evidence`, verify, metrics, doctor, review, ship, release, reap, and explicit worktree status/merge/removal. Prefer human commands for destructive operations.
+Model-facing `task_control` actions provide status, result, list, handoff, `record_evidence`, verify, metrics, doctor, review, record_review, respond, ship, release, reap, and explicit worktree status/merge/removal. `list` enumerates recent durable task runs (id, agent type, phase, outcome, worktree state, age) without a task id. Prefer human commands for destructive operations.
 
 In Herdr, treat lifecycle state as a wake-up hint:
 

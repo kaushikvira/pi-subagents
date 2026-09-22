@@ -1,13 +1,6 @@
 import { Type } from "typebox";
 
-export interface TaskSchemaOptions {
-  /** subagents.defaultModel from settings; injected into the model param description. */
-  defaultModel?: string;
-}
-
-export function taskParametersSchema(options: TaskSchemaOptions = {}) {
-  const defaultModel =
-    options.defaultModel ?? "subagents.defaultModel from settings";
+export function taskParametersSchema() {
   return Type.Object({
     agent_type: Type.Optional(Type.String({
       description:
@@ -45,11 +38,14 @@ export function taskParametersSchema(options: TaskSchemaOptions = {}) {
           "Durable specialist conversation id. Reuses .pi/artifacts/task-<id>/sessions when called again.",
       }),
     ),
-    model: Type.String({
+    model: Type.Optional(Type.String({
       description:
-        `Launch model, as 'provider/model-id'. Required for fresh launches — pass '${defaultModel}' when you have no preference. Call list_models for the full available set. When omitted at runtime it falls back to the agent profile's pinned model, then the session model. Ignored when resuming via task_id.`,
-    }),
-    __pi_subagents_invocation_id: Type.Optional(Type.String()),
+        "Launch model, as 'provider/model-id'. Optional — when omitted it resolves to subagents.agentModels[agent_type], then subagents.defaultModel, then the agent profile's pinned model, then the session model. Fresh launches are validated against the static list from list_models (subagents.availableModels) when that list is non-empty. Ignored when resuming via task_id.",
+    })),
+    __pi_subagents_invocation_id: Type.Optional(Type.String({
+      description:
+        "Internal invocation id managed by the extension; do not set.",
+    })),
     background: Type.Optional(
       Type.Boolean({
         description:

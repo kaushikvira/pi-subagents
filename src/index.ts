@@ -249,8 +249,6 @@ export default function (pi: ExtensionAPI) {
 
   // ── Tool Registration ──────────────────────────────────────────────────
 
-  const registrationSettings = loadSubagentSettings(process.cwd());
-
   pi.registerTool({
     name: taskToolName,
     label: taskToolName,
@@ -261,16 +259,14 @@ export default function (pi: ExtensionAPI) {
       "Launch multiple agents concurrently by making multiple tool calls in a single message",
       "Do NOT duplicate work you've delegated — wait for the result or work on non-overlapping tasks",
       "Use agent_type to route to the right specialist",
-      "Set the launch model via the model param (provider/model-id); it overrides the profile pin and subagents.defaultModel — call list_models for the available set",
+      "The model param (provider/model-id) is optional; when omitted it resolves through subagents settings, then the profile pin, then the session model — call list_models for the available set",
       "Tell the agent whether to write code or just research",
       "For background tasks: DO NOT sleep, poll, or check on progress. You'll be notified",
       "After delegated work completes, read changed files, review diff, verify scope, and run relevant checks",
       "Send the user a concise summary of the result since the agent's output is not user-visible",
       "For repo-local search (explore/general), name an absolute repo path in the prompt when the parent cwd is not the target (e.g. pi-task extension repo vs app repo)",
         ],
-        parameters: taskParametersSchema({
-          defaultModel: registrationSettings.defaultModel,
-        }),
+        parameters: taskParametersSchema(),
 
         async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const { agents, piDir } = discoverAgents(ctx.cwd, BUNDLED_AGENT_DIR);
@@ -780,13 +776,14 @@ export default function (pi: ExtensionAPI) {
         };
         await writeFile(promptLaunch.systemPromptPath, agent.body, "utf8");
       }
-      // Model precedence: explicit launch param > subagents.defaultModel setting
-      // (fresh launches only — resuming keeps the resumed session's model)
-      // > agent profile pin > session model.
+      // Model precedence: explicit launch param > subagents.agentModels[agent_type]
+      // > subagents.defaultModel setting (fresh launches only — resuming keeps
+      // the resumed session's model) > agent profile pin > session model.
       const subagentSettings = loadSubagentSettings(ctx.cwd);
+      const agentModelDefault = subagentSettings.agentModels?.[agent.name];
       const modelOverride = resume
         ? params.model
-        : params.model ?? subagentSettings.defaultModel;
+        : params.model ?? agentModelDefault ?? subagentSettings.defaultModel;
       if (!resume && typeof params.model === "string" && params.model.trim().length > 0) {
         const knownModels = (subagentSettings.availableModels ?? []).map(
           (m) => m.model,
@@ -1490,6 +1487,14 @@ export default function (pi: ExtensionAPI) {
       if (settings.defaultModel) {
         lines.push(`Default: ${settings.defaultModel}`);
       }
+      if (settings.agentModels && Object.keys(settings.agentModels).length > 0) {
+        lines.push(
+          "Per-agent-type defaults (subagents.agentModels):",
+          ...Object.entries(settings.agentModels).map(
+            ([agentType, model]) => `- ${agentType}: ${model}`,
+          ),
+        );
+      }
       if (models.length === 0) {
         lines.push(
           "(no models configured — add subagents.availableModels to .pi/settings.json or ~/.pi/agent/settings.json)",
@@ -1503,9 +1508,20 @@ export default function (pi: ExtensionAPI) {
           ),
         );
       }
-      lines.push(
+      if (settings.availableModelSkipped?.length) {
+        lines.push(
+          "Skipped malformed settings entries:",
+          ...settings.availableModelSkipped.map((s) => `! ${s}`),
+        );
+      }
+      const sourceLine = settings.sources.projectOverrides
+        ? `Settings source: project ${settings.sources.projectPath} (overrides global ${settings.sources.globalPath})`
+        : settings.sources.projectPath
+          ? `Settings source: global ${settings.sources.globalPath} (project ${settings.sources.projectPath} has no subagents keys)`
+          : `Settings source: global ${settings.sources.globalPath}`;
+      lines.push(sourceLine,
         "",
-        "Pass one of these (provider/model-id) as the model param when calling the task tool.",
+        "Pass one of these (provider/model-id) as the model param when calling the task tool (optional — defaults apply when omitted).",
       );
       return {
         content: [{ type: "text" as const, text: lines.join("\n") }],
@@ -1513,6 +1529,9 @@ export default function (pi: ExtensionAPI) {
           phase: "ok" as const,
           default_model: settings.defaultModel ?? null,
           model_count: models.length,
+          agent_models: settings.agentModels ?? null,
+          source: settings.sources,
+          skipped: settings.availableModelSkipped ?? [],
         },
       };
     },

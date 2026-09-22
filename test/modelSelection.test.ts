@@ -124,19 +124,91 @@ test("loadSubagentSettings: global default, project override, no key", () => {
   process.env.HOME = home;
   try {
     // global only
-    assert.deepEqual(loadSubagentSettings(project), { defaultModel: "global/model" });
+    const globalOnly = loadSubagentSettings(project);
+    assert.equal(globalOnly.defaultModel, "global/model");
+    assert.equal(globalOnly.sources.projectOverrides, false);
+    assert.equal(globalOnly.sources.projectPath, join(project, ".pi", "settings.json"));
+    assert.equal(globalOnly.sources.globalPath, globalSettings);
 
     // project overrides global
     writeFileSync(
       join(project, ".pi", "settings.json"),
       JSON.stringify({ subagents: { defaultModel: "project/model" } }),
     );
-    assert.deepEqual(loadSubagentSettings(outer), { defaultModel: "project/model" });
+    const overridden = loadSubagentSettings(outer);
+    assert.equal(overridden.defaultModel, "project/model");
+    assert.equal(overridden.sources.projectOverrides, true);
 
-    // no subagents key anywhere -> empty
+    // no subagents key anywhere -> empty (but sources still reported)
     rmSync(join(project, ".pi"), { recursive: true });
     writeFileSync(globalSettings, JSON.stringify({}));
-    assert.deepEqual(loadSubagentSettings(outer), {});
+    const empty = loadSubagentSettings(outer);
+    assert.equal(empty.defaultModel, undefined);
+    assert.equal(empty.availableModels, undefined);
+    assert.equal(empty.sources.projectPath, null);
+    assert.equal(empty.sources.projectOverrides, false);
+  } finally {
+    process.env.HOME = originalHome;
+  }
+});
+
+test("loadSubagentSettings: agentModels, skipped entries, and shadowing", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-subagents-home2-"));
+  const globalSettings = join(home, ".pi", "agent", "settings.json");
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeFileSync(
+    globalSettings,
+    JSON.stringify({
+      subagents: {
+        defaultModel: "global/model",
+        availableModels: [
+          "global/good",
+          { model: "global/obj", description: "note" },
+          "",
+          { model: 42 },
+          null,
+        ],
+        agentModels: { coder: "global/coder-model", general: 7 },
+      },
+    }),
+  );
+
+  const project = mkdtempSync(join(tmpdir(), "pi-subagents-proj2-"));
+  mkdirSync(join(project, ".pi"), { recursive: true });
+  const originalHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const loaded = loadSubagentSettings(project);
+    // valid entries applied, malformed ones reported (never applied)
+    assert.deepEqual(loaded.availableModels, [
+      { model: "global/good" },
+      { model: "global/obj", description: "note" },
+    ]);
+    assert.deepEqual(loaded.agentModels, { coder: "global/coder-model" });
+    assert.ok(loaded.availableModelSkipped);
+    assert.equal(loaded.availableModelSkipped.length, 4);
+    assert.match(loaded.availableModelSkipped[0], /availableModels\[3\].*empty string/);
+    assert.match(loaded.availableModelSkipped[1], /availableModels\[4\].*string 'model'/);
+    assert.match(loaded.availableModelSkipped[2], /availableModels\[5\].*expected/);
+    assert.match(
+      loaded.availableModelSkipped[3],
+      /agentModels\["general"\]: expected a model string/,
+    );
+
+    // project shadowing is per-key: the project availableModels suppresses
+    // the global availableModels notes, but the still-effective global
+    // agentModels note remains
+    writeFileSync(
+      join(project, ".pi", "settings.json"),
+      JSON.stringify({ subagents: { availableModels: ["project/model"] } }),
+    );
+    const shadowed = loadSubagentSettings(project);
+    assert.deepEqual(shadowed.availableModels, [{ model: "project/model" }]);
+    assert.equal(shadowed.defaultModel, "global/model");
+    assert.deepEqual(shadowed.availableModelSkipped, [
+      'agentModels["general"]: expected a model string',
+    ]);
+    assert.equal(shadowed.sources.projectOverrides, true);
   } finally {
     process.env.HOME = originalHome;
   }

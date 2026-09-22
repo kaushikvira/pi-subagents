@@ -758,4 +758,75 @@ describe("task_control orchestration tool", () => {
     });
     expect(doctor.details).toMatchObject({ status: "issues", exitCode: 1 });
   });
+
+  it("list reports no runs in a fresh project", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const tool = createTaskControlTool();
+    const result = await tool.execute(
+      "list-empty",
+      { action: "list" },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]).toMatchObject({
+      text: expect.stringContaining("No durable task runs"),
+    });
+    expect(result.details).toMatchObject({ count: 0, shown: 0 });
+  });
+
+  it("list shows recent runs, most recently updated first, without a task id", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    const first = createDurableRun({
+      invocationId: "list-invocation-1",
+      projectDirectory,
+      agentType: "coder",
+      description: "First task",
+      startedAt: "2026-09-20T09:00:00.000Z",
+    });
+    first.taskId = "task-list-1";
+    first.executionPhase = "completed";
+    first.reportedOutcome = "success";
+    first.updatedAt = "2026-09-20T10:00:00.000Z";
+    await putDurableRun(paths.runStore, first);
+    const second = createDurableRun({
+      invocationId: "list-invocation-2",
+      projectDirectory,
+      agentType: "general",
+      description: "Second task",
+    });
+    second.taskId = "task-list-2";
+    second.executionPhase = "working";
+    await putDurableRun(paths.runStore, second);
+
+    const tool = createTaskControlTool();
+    const result = await tool.execute(
+      "list-call",
+      { action: "list" },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    expect(result.isError).toBeUndefined();
+    const text: string = (result.content[0] as { text: string }).text;
+    // both runs are listed
+    expect(text).toContain("- task-list-1");
+    expect(text).toContain("- task-list-2");
+    // most recently updated first
+    expect(text.indexOf("- task-list-2")).toBeGreaterThan(-1);
+    expect(text.indexOf("- task-list-1")).toBeGreaterThan(-1);
+    expect(text.indexOf("- task-list-2")).toBeLessThan(
+      text.indexOf("- task-list-1"),
+    );
+    expect(text).toContain("working");
+    expect(text).toContain("(reported: success)");
+    expect(result.details).toMatchObject({ count: 2, shown: 2 });
+    expect(result.details?.runs).toHaveLength(2);
+    expect(result.details?.runs[0]).toMatchObject({
+      taskId: "task-list-2",
+      executionPhase: "working",
+    });
+  });
 });

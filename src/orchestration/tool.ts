@@ -65,6 +65,7 @@ const TaskControlParameters = Type.Object(
     action: Type.Union([
       Type.Literal("status"),
       Type.Literal("result"),
+      Type.Literal("list"),
       Type.Literal("handoff"),
       Type.Literal("record_evidence"),
       Type.Literal("verify"),
@@ -128,7 +129,7 @@ export function registerTaskControlTool(pi: ExtensionAPI): void {
     name: "task_control",
     label: "Task Control",
     description:
-      "Query delegated task status/results, append scoped handoffs or evidence, inspect local orchestration health, and perform explicit review or cleanup actions.",
+      "Query delegated task status/results, list recent tasks, append scoped handoffs or evidence, inspect local orchestration health, and perform explicit review or cleanup actions.",
     parameters: TaskControlParameters,
     async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
       return executeHerdrAction(input, ctx.cwd, pi);
@@ -150,6 +151,8 @@ async function executeHerdrAction(
       return taskStatusResult(projectDirectory, requireValue(input.task_id, "task_id"));
     case "result":
       return taskFinalResult(projectDirectory, requireValue(input.task_id, "task_id"));
+    case "list":
+      return taskListResult(paths);
     case "handoff": {
       const taskId = requireValue(input.task_id, "task_id");
       if (!input.handoff) {
@@ -1205,6 +1208,73 @@ async function executeHerdrAction(
       };
     }
   }
+}
+
+async function taskListResult(paths: OrchestrationPaths) {
+  const runs = (await listDurableRuns(paths.runStore))
+    .slice()
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  if (runs.length === 0) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: "No durable task runs recorded for this project yet.",
+        },
+      ],
+      details: { count: 0, shown: 0 },
+    };
+  }
+  const recent = runs.slice(0, 20);
+  const lines = [
+    `Durable task runs (${recent.length}${
+      runs.length > recent.length ? ` of ${runs.length}` : ""
+    }, most recently updated first):`,
+    ...recent.map((run) => {
+      const id = run.taskId ?? run.invocationId;
+      const outcome =
+        run.reportedOutcome && run.reportedOutcome !== "unknown"
+          ? ` (reported: ${run.reportedOutcome})`
+          : "";
+      const worktree = run.worktreeDisposition
+        ? ` [worktree ${run.worktreeDisposition}]`
+        : run.worktree
+          ? " [worktree retained]"
+          : "";
+      return `- ${id} · ${run.agentType ?? "?"} · ${run.executionPhase}${outcome}${worktree} · ${formatRunAge(run.updatedAt)} · ${run.description ?? ""}`.trim();
+    }),
+    "",
+    "Use task_control status/result with a task id for detail.",
+  ];
+  return {
+    content: [{ type: "text" as const, text: lines.join("\n") }],
+    details: {
+      count: runs.length,
+      shown: recent.length,
+      runs: recent.map((run) => ({
+        taskId: run.taskId,
+        invocationId: run.invocationId,
+        agentType: run.agentType,
+        executionPhase: run.executionPhase,
+        reportedOutcome: run.reportedOutcome,
+        worktreeDisposition: run.worktreeDisposition,
+        updatedAt: run.updatedAt,
+        description: run.description,
+      })),
+    },
+  };
+}
+
+function formatRunAge(isoTimestamp: string): string {
+  const elapsedMs = Date.now() - new Date(isoTimestamp).getTime();
+  if (!Number.isFinite(elapsedMs)) return "age ?";
+  const minutes = Math.max(0, Math.floor(elapsedMs / 60_000));
+  if (minutes < 1) return "age <1m";
+  if (minutes < 60) return `age ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `age ${hours}h ${minutes % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `age ${days}d ${hours % 24}h`;
 }
 
 async function taskStatusResult(projectDirectory: string, taskId: string) {
