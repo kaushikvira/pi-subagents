@@ -1,0 +1,787 @@
+/**
+ * Task Extension — Pure helper functions.
+ *
+ * No side effects, no ExtensionAPI dependency. All functions here are
+ * unit-testable with node:assert/strict.
+ */
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join, dirname, basename, resolve } from "node:path";
+import { parseToolList } from "./agent-tools.js";
+import { parseMergedDisallowedTools } from "./policy.js";
+import { matchesJsonlTailViewSessionName, readJsonlTailViews, } from "./session-tail-cache.js";
+import { buildPiArgv, } from "./subagent/buildArgv.js";
+function parseMarkdownFrontmatter(content) {
+    if (!content.startsWith("---\n")) {
+        return { frontmatter: {}, body: content };
+    }
+    const end = content.indexOf("\n---", 4);
+    if (end === -1)
+        return { frontmatter: {}, body: content };
+    const raw = content.slice(4, end).trim();
+    const body = content.slice(end + "\n---".length).replace(/^\n/, "");
+    const frontmatter = {};
+    for (const line of raw.split("\n")) {
+        const idx = line.indexOf(":");
+        if (idx === -1)
+            continue;
+        const key = line.slice(0, idx).trim();
+        const value = line.slice(idx + 1).trim();
+        if (key)
+            frontmatter[key] = value;
+    }
+    return { frontmatter, body };
+}
+export function assessTaskResult(result) {
+    const reportedStatus = isTaskReportedStatus(result.status)
+        ? result.status
+        : "unknown";
+    return {
+        reportedStatus,
+        valid: reportedStatus !== "unknown" && result.summary.length > 0,
+    };
+}
+function isTaskReportedStatus(status) {
+    return (status === "success" ||
+        status === "failure" ||
+        status === "blocked" ||
+        status === "partial" ||
+        status === "reframed" ||
+        status === "unknown");
+}
+// ─── Constants ───────────────────────────────────────────────────────────────
+export const TASK_BACKGROUND_DEFAULT = true;
+export const TASK_PROMPT_INSTRUCTIONS = `Your final assistant message IS the result the parent agent will read.
+
+When you are done, end with the XML envelope described below (or the <result> block from your agent instructions). Do not write a RESULT.md file — the parent reads your final assistant message from the session JSONL, not from any file.`;
+/**
+ * XML envelope for the task result. The parent agent parses the child
+ * subagent's final message with `parseResultXml`, which reads `<status>`,
+ * `<summary>`, `<findings>`, `<evidence>`, and `<files>` tags. Append
+ * this to the child prompt so the child knows to wrap its final result
+ * in these tags (the parent then extracts them into the result section).
+ */
+export const TASK_RESULT_XML_INSTRUCTIONS = `When the task is complete, wrap the final result in this XML envelope (or the agent's <result> block with the same inner tags). Nothing after the closing tag:
+
+<status>success | failure | blocked | partial | reframed</status>
+<summary>One-line summary of the outcome.</summary>
+<findings>Key findings. Plain text, multiple lines OK.</findings>
+<evidence>Citations, URLs, command snippets. <sources> is accepted as an alias for evidence.</evidence>
+<files>Files created or modified. Leave empty if none.</files>
+<caveats>Risks, gaps, uncertainty. <blockers> is accepted as an alias.</caveats>
+<next_steps>Follow-up actions. <checks> is accepted as an alias.</next_steps>
+<confidence>high | medium | low</confidence>
+
+Use status "reframed" when the task's framing turned out to be wrong and you delivered the corrected framing instead — it is a valid outcome, not a failure. Explain the reframe in summary/findings.
+
+Optional tag, only when the parent must decide something you cannot. Its body MUST be one JSON object with a stable question and 2-8 options:
+<needs_decision>{"question":"Which direction should I take?","options":[{"id":"a","label":"Direction A","tradeoff":"Faster, less flexible"},{"id":"b","label":"Direction B","tradeoff":"Slower, more flexible"}],"context":"Why the choice is required now"}</needs_decision>
+
+Do not put free-form prose in <needs_decision>; an unparseable request cannot pause and resume the task safely.
+
+<decisions> is merged into findings. The parent parses these tags for the task UI.`;
+export const TASK_TOOL_DESCRIPTION = `Launch a new agent to handle complex, multistep tasks autonomously.
+
+Include relevant context from your current work in the prompt parameter —
+this becomes the subagent's instructions. The subagent knows nothing about what you've been doing except what you put in the prompt.
+
+When NOT to use:
+- To read a specific file path, use Read or Grep instead
+- To search for a class definition like 'class Foo', use Grep instead
+- To search code within 2-3 files, use Read instead
+- If no available agent fits the task, use other tools directly
+
+Prompt contract:
+- Outcome: the governed outcome wanted, stated as observable behavior — not an implementation
+- Frontier: the open questions the agent OWNS deciding (approach, design within scope, test strategy)
+- Locked decisions: constraints that stand, each WITH rationale and an unlock condition ("locked because X; challenge it if you find evidence Y")
+- Acceptance: what evidence would convince a skeptic the outcome holds — the agent chooses HOW to produce it
+- Non-goals: what to avoid or leave untouched
+- Write/read policy: whether the agent may edit files or must stay read-only
+
+Do not hand the agent a verification recipe, a chosen architecture, or pre-named acceptance criteria unless they are genuinely locked; every locked item must carry its rationale.
+
+Usage notes:
+1. Provide complete context in the prompt — the subagent starts with a fresh context
+2. Launch multiple agents concurrently when possible (use a single message with multiple tool calls)
+3. Once you delegate work, do NOT duplicate it. Continue with non-overlapping tasks, or wait for the result
+4. Background is the default. Use background:false only when you need the caller to wait inline for the tmux task result
+5. Do not trust delegated output blindly. Read changed files, review the diff, verify scope, and run the relevant checks before claiming completion
+6. Clearly tell the agent whether to write code or just research, since it doesn't know the user's intent
+7. The result returned by the agent is not visible to the user. Send a concise summary back to the user
+8. Pass task_id to resume a previous subagent session (continues with its prior context)
+
+Recommended orchestration patterns (still using only task):
+- Fan-out and synthesize: launch several read-only tasks, then one reviewer/synthesizer task
+- Adversarial verification: pair a producer task with an independent skeptic/verifier task
+- Tournament/ranking: launch competing candidates, then a comparator task with a rubric
+- Loop until done: repeat targeted tasks until no new findings or no remaining failures
+
+Background mode (background: true):
+- Launches the subagent asynchronously and returns immediately
+- You will be notified automatically when it finishes
+- DO NOT sleep, poll, ask the task for status, or duplicate its work while it runs in background
+- Avoid working with the same files or topics the background task is using
+- Work on non-overlapping tasks, or briefly tell the user what you launched and end your response`;
+/** @deprecated Import from ./agent-tools.js */
+export { ALL_TOOL_NAMES } from "./agent-tools.js";
+// Cached regex patterns for XML result parsing
+const STATUS_RE = /<status>([\s\S]*?)<\/status>/i;
+const DEFAULT_DISALLOWED_TOOLS = ["xai_web_search", "xai_generate_text"];
+const SUMMARY_RE = /<summary>([\s\S]*?)<\/summary>/i;
+const FINDINGS_RE = /<findings>([\s\S]*?)<\/findings>/i;
+const EVIDENCE_RE = /<evidence>([\s\S]*?)<\/evidence>/i;
+const FILES_RE = /<files>([\s\S]*?)<\/files>/i;
+const CAVEATS_RE = /<caveats>([\s\S]*?)<\/caveats>/i;
+const NEXT_STEPS_RE = /<next_steps>([\s\S]*?)<\/next_steps>/i;
+const CONFIDENCE_RE = /<confidence>([\s\S]*?)<\/confidence>/i;
+const SOURCES_RE = /<sources>([\s\S]*?)<\/sources>/i;
+const BLOCKERS_RE = /<blockers>([\s\S]*?)<\/blockers>/i;
+const CHECKS_RE = /<checks>([\s\S]*?)<\/checks>/i;
+const DECISIONS_RE = /<decisions>([\s\S]*?)<\/decisions>/i;
+const NEEDS_DECISION_RE = /<needs_decision>([\s\S]*?)<\/needs_decision>/i;
+const PLAIN_SUMMARY_MAX_CHARS = 500;
+// ─── Result Parsing ──────────────────────────────────────────────────────────
+export function extractTag(raw, re) {
+    const m = raw.match(re);
+    return m ? m[1].trim() : "";
+}
+function joinParsedSections(...parts) {
+    return parts.map((p) => p.trim()).filter(Boolean).join("\n\n");
+}
+function hasStructuredResultTags(raw) {
+    const tags = [
+        STATUS_RE,
+        SUMMARY_RE,
+        FINDINGS_RE,
+        EVIDENCE_RE,
+        FILES_RE,
+        CAVEATS_RE,
+        NEXT_STEPS_RE,
+        SOURCES_RE,
+        BLOCKERS_RE,
+        CHECKS_RE,
+        DECISIONS_RE,
+        NEEDS_DECISION_RE,
+    ];
+    return tags.some((re) => extractTag(raw, re).length > 0);
+}
+export function parseResultXml(raw) {
+    const status = extractTag(raw, STATUS_RE);
+    if (!hasStructuredResultTags(raw)) {
+        const trimmed = raw.trim();
+        return {
+            status: "unknown",
+            summary: trimmed.length > PLAIN_SUMMARY_MAX_CHARS
+                ? trimmed.slice(0, PLAIN_SUMMARY_MAX_CHARS)
+                : trimmed,
+            findings: "",
+            evidence: "",
+            files: "",
+            caveats: "",
+            next_steps: "",
+            confidence: "",
+            raw,
+        };
+    }
+    const confidence = extractTag(raw, CONFIDENCE_RE);
+    const findings = joinParsedSections(extractTag(raw, FINDINGS_RE), extractTag(raw, DECISIONS_RE));
+    const evidence = joinParsedSections(extractTag(raw, EVIDENCE_RE), extractTag(raw, SOURCES_RE));
+    const caveats = joinParsedSections(extractTag(raw, CAVEATS_RE), extractTag(raw, BLOCKERS_RE));
+    const next_steps = joinParsedSections(extractTag(raw, NEXT_STEPS_RE), extractTag(raw, CHECKS_RE));
+    const needs_decision = extractTag(raw, NEEDS_DECISION_RE);
+    const decision_request = needs_decision
+        ? parseTaskDecisionRequest(needs_decision)
+        : undefined;
+    return {
+        status: status || "unknown",
+        summary: extractTag(raw, SUMMARY_RE) || "",
+        findings,
+        evidence,
+        files: extractTag(raw, FILES_RE) || "",
+        caveats,
+        next_steps,
+        confidence: confidence || "",
+        ...(needs_decision ? { needs_decision } : {}),
+        ...(decision_request ? { decision_request } : {}),
+        raw,
+    };
+}
+export function parseTaskDecisionRequest(raw) {
+    let value;
+    try {
+        value = JSON.parse(raw);
+    }
+    catch {
+        return undefined;
+    }
+    if (typeof value !== "object" ||
+        value === null ||
+        typeof value.question !== "string" ||
+        !Array.isArray(value.options)) {
+        return undefined;
+    }
+    const object = value;
+    const question = object.question.trim();
+    const options = object.options;
+    if (question.length === 0 ||
+        question.length > 2_000 ||
+        options.length < 2 ||
+        options.length > 8) {
+        return undefined;
+    }
+    const parsedOptions = [];
+    const seen = new Set();
+    for (const option of options) {
+        if (typeof option !== "object" || option === null)
+            return undefined;
+        const record = option;
+        if (typeof record.id !== "string" || typeof record.label !== "string") {
+            return undefined;
+        }
+        const id = record.id.trim();
+        const label = record.label.trim();
+        if (!/^[A-Za-z0-9._-]{1,64}$/u.test(id) ||
+            label.length === 0 ||
+            label.length > 500 ||
+            seen.has(id)) {
+            return undefined;
+        }
+        if (record.tradeoff !== undefined && typeof record.tradeoff !== "string") {
+            return undefined;
+        }
+        seen.add(id);
+        parsedOptions.push({
+            id,
+            label,
+            ...(typeof record.tradeoff === "string" && record.tradeoff.trim()
+                ? { tradeoff: record.tradeoff.trim().slice(0, 1_000) }
+                : {}),
+        });
+    }
+    if (object.context !== undefined && typeof object.context !== "string") {
+        return undefined;
+    }
+    return {
+        question,
+        options: parsedOptions,
+        ...(typeof object.context === "string" && object.context.trim()
+            ? { context: object.context.trim().slice(0, 2_000) }
+            : {}),
+    };
+}
+export function buildTaskEnvelope(parsed, meta) {
+    const assessment = assessTaskResult(parsed);
+    return {
+        content: [{ type: "text", text: parsed.summary }],
+        details: {
+            agent_type: meta.agent_type,
+            description: meta.description,
+            tool_uses: meta.tool_uses,
+            duration_ms: meta.duration_ms,
+            background: meta.background,
+            status: assessment.reportedStatus,
+            result_valid: assessment.valid,
+            summary: parsed.summary,
+            findings: parsed.findings,
+            evidence: parsed.evidence,
+            files: parsed.files,
+            caveats: parsed.caveats,
+            next_steps: parsed.next_steps,
+            ...(parsed.needs_decision ? { needs_decision: parsed.needs_decision } : {}),
+            ...(parsed.decision_request
+                ? { decision_request: structuredClone(parsed.decision_request) }
+                : {}),
+            structured_result: assessment.valid,
+        },
+    };
+}
+// ─── Formatting ──────────────────────────────────────────────────────────────
+export function formatMs(ms) {
+    if (ms >= 60_000)
+        return `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1_000)}s`;
+    if (ms >= 1_000)
+        return `${(ms / 1_000).toFixed(1)}s`;
+    return `${ms}ms`;
+}
+export function parseIdTimestamp(id) {
+    try {
+        const ts36 = id.split("-")[0];
+        if (ts36)
+            return parseInt(ts36, 36);
+    }
+    catch {
+        /* fall through */
+    }
+    return Date.now();
+}
+export function shellQuote(value) {
+    return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+export function chooseTmuxSplitDirection(paneWidth, paneHeight, configuredMode) {
+    const mode = configuredMode?.trim().toLowerCase();
+    if (mode === "horizontal")
+        return "-h";
+    if (mode === "vertical")
+        return "-v";
+    const hasGeometry = Number.isFinite(paneWidth) &&
+        Number.isFinite(paneHeight) &&
+        paneWidth > 0 &&
+        paneHeight > 0;
+    if (!hasGeometry)
+        return "-v";
+    return paneWidth >= 2 * paneHeight ? "-h" : "-v";
+}
+export function buildTmuxSplitWindowArgs(cwd, command, direction = "-h", targetPane) {
+    const args = [
+        "split-window",
+        direction,
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+    ];
+    if (targetPane)
+        args.push("-t", targetPane);
+    args.push("-c", cwd, command);
+    return args;
+}
+export function formatBackgroundReceipt(input) {
+    return [
+        `⎿ Started task ${input.taskId} with ${input.agentType}.`,
+        ...(input.backend ? [`  Backend: ${input.backend}${input.backendReason ? ` (${input.backendReason})` : ""}`] : []),
+        `  Subagent sessions: ${input.sessionPath}`,
+    ].join("\n");
+}
+// ─── Agent Discovery ─────────────────────────────────────────────────────────
+export function findPiDir(cwd) {
+    let current = resolve(cwd);
+    while (true) {
+        if (basename(current) === ".pi") {
+            const parent = dirname(current);
+            if (parent === current)
+                return current;
+            current = parent;
+            continue;
+        }
+        if (existsSync(join(current, ".pi")))
+            return join(current, ".pi");
+        const parent = dirname(current);
+        if (parent === current)
+            return null;
+        current = parent;
+    }
+}
+function getGlobalAgentDir() {
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    return join(home, ".pi", "agent", "agents");
+}
+export function loadAgentsFromDir(dir, source) {
+    const agents = [];
+    if (!existsSync(dir))
+        return agents;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.name.endsWith(".md"))
+            continue;
+        if (!entry.isFile() && !entry.isSymbolicLink())
+            continue;
+        const filePath = join(dir, entry.name);
+        let content;
+        try {
+            content = readFileSync(filePath, "utf-8");
+        }
+        catch {
+            continue;
+        }
+        const { frontmatter, body } = parseMarkdownFrontmatter(content);
+        if (!frontmatter.description)
+            continue;
+        const name = basename(entry.name, ".md");
+        const disallowedRaw = frontmatter.disallowed_tools;
+        const hidden = parseBool(frontmatter.hidden);
+        const proactive = parseBool(frontmatter.proactive);
+        const readonly = parseBool(frontmatter.readonly);
+        // Always-on xAI disallow list — these tools are never useful for
+        // task subagents and risk leaking provider-specific behavior.
+        const withDefaults = [
+            ...parseToolList(disallowedRaw),
+            ...DEFAULT_DISALLOWED_TOOLS,
+            ...(readonly ? READONLY_TOOL_DENY : []),
+        ];
+        const merged = parseMergedDisallowedTools(withDefaults.join(","));
+        const disallowedTools = merged.length > 0 ? merged : undefined;
+        const tools = parseToolList(frontmatter.tools);
+        agents.push({
+            name,
+            description: frontmatter.description,
+            model: frontmatter.model,
+            thinking: frontmatter.thinking,
+            tools: tools.length > 0 ? tools : undefined,
+            disallowedTools,
+            hidden,
+            proactive,
+            readonly,
+            body,
+            source,
+            path: filePath,
+        });
+    }
+    return agents;
+}
+export function discoverAgents(cwd, bundledAgentDir) {
+    const piDir = findPiDir(cwd) || join(cwd, ".pi");
+    const projectDir = join(piDir, "agents");
+    const userDir = getGlobalAgentDir();
+    const bundledAgents = bundledAgentDir
+        ? loadAgentsFromDir(bundledAgentDir, "bundled")
+        : [];
+    const userAgents = loadAgentsFromDir(userDir, "user");
+    const projectAgents = loadAgentsFromDir(projectDir, "project");
+    // Override order: bundled < user < project.
+    const agentMap = new Map();
+    for (const a of bundledAgents)
+        agentMap.set(a.name, a);
+    for (const a of userAgents)
+        agentMap.set(a.name, a);
+    for (const a of projectAgents)
+        agentMap.set(a.name, a);
+    return {
+        agents: Array.from(agentMap.values()).sort((a, b) => a.name.localeCompare(b.name)),
+        piDir,
+    };
+}
+/** Known mutators denied for diagnostics; runtime also enforces a positive read-only allowlist. */
+const READONLY_TOOL_DENY = [
+    "bash",
+    "write",
+    "edit",
+    "apply_patch",
+    "quick_edit",
+    "target_edit",
+    "todo",
+    "workflow_state",
+];
+export function parseBool(value) {
+    if (value === true || value === "true" || value === "yes" || value === "1")
+        return true;
+    if (value === false || value === "false" || value === "no" || value === "0")
+        return false;
+    return undefined;
+}
+function isAgentHidden(agent) {
+    return agent.hidden === true;
+}
+function isAgentProactive(agent) {
+    return agent.proactive === true;
+}
+function getTaskAgents(agents) {
+    return agents.filter((a) => !isAgentHidden(a));
+}
+export function resolveTaskAgentPreflight(agents, agentType) {
+    const agent = agents.find((a) => a.name === agentType);
+    if (agent && isAgentHidden(agent)) {
+        return {
+            ok: false,
+            result: {
+                text: `Agent "${agentType}" is hidden and cannot be invoked via the task tool.`,
+                error: `Hidden agent: ${agentType}`,
+            },
+        };
+    }
+    if (!agent) {
+        const list = formatAgentList(getTaskAgents(agents));
+        return {
+            ok: false,
+            result: {
+                text: `Unknown agent: "${agentType}".\nAvailable agents:\n${list}`,
+                error: `Unknown agent: ${agentType}`,
+            },
+        };
+    }
+    return { ok: true, agent };
+}
+export function buildTaskToolDescription(agents) {
+    const visible = getTaskAgents(agents);
+    const proactive = visible.filter(isAgentProactive);
+    const proactiveBlock = proactive.length > 0
+        ? [
+            "",
+            "PROACTIVE — delegate via task without user @mention when triggers match (see parent APPEND_SYSTEM.md):",
+            ...proactive.map((a) => `- ${a.name}: ${a.description.replace(/\s+/g, " ").trim()}`),
+        ].join("\n")
+        : "";
+    return [
+        TASK_TOOL_DESCRIPTION,
+        "",
+        "Available agents:",
+        formatAgentList(visible),
+        proactiveBlock,
+    ].join("\n");
+}
+export function formatAgentList(agents) {
+    if (agents.length === 0)
+        return "none available";
+    return agents
+        .map((a) => `${a.name} (${a.source}): ${a.description}`)
+        .join("\n");
+}
+// ─── Sub-agent CLI args ─────────────────────────────────────────────────────
+/**
+ * Build pi CLI arguments for spawning or resuming a sub-agent session.
+ *
+ * - Fresh spawn: omit `resume` or pass falsy — `--session` is not included.
+     * - Resume: pass `resume=true` and optionally `resumeSessionRef` —
+     *   `--session <ref>` is included so pi continues an existing session.
+     */
+export function buildPiArgs(agent, sessionName, sessionDir, promptContent, resume, parentToolNames, taskToolName, resumeSessionRef, promptLaunch, modelOverride) {
+    return buildPiArgv({
+        agent,
+        sessionName,
+        sessionDir,
+        promptContent,
+        resume,
+        resumeSessionRef,
+        parentToolNames,
+        taskToolName,
+        promptLaunch,
+        model: modelOverride,
+    });
+}
+// ─── JSONL Session Helpers ───────────────────────────────────────────────────
+/**
+ * Count tool uses and turns from pi JSONL session files.
+ * Reads go through the incremental tail cache (only appended bytes are
+ * read and parsed), so the 1s progress poll no longer re-reads the whole
+ * session on every tick.
+ */
+export function countToolUses(sessionDir, sessionName) {
+    let toolUses = 0;
+    let turns = 0;
+    try {
+        if (!existsSync(sessionDir))
+            return { toolUses, turns };
+        const views = readJsonlTailViews(sessionDir);
+        for (const view of views) {
+            if (!matchesJsonlTailViewSessionName(view, sessionName))
+                continue;
+            for (const entry of view.entries) {
+                if (entry.type !== "message")
+                    continue;
+                const msg = entry.message;
+                if (msg?.role !== "assistant" || !Array.isArray(msg.content))
+                    continue;
+                turns++;
+                for (const block of msg.content) {
+                    // A null/undefined block aborted this line in the fresh-read
+                    // helper (property access threw inside the per-line catch):
+                    // the turn was counted, but blocks after it were not.
+                    if (block === null || block === undefined)
+                        break;
+                    if (isUnknownRecord(block) && block.type === "toolCall")
+                        toolUses++;
+                }
+            }
+        }
+    }
+    catch {
+        // Session dir might not exist or be inaccessible
+    }
+    return { toolUses, turns };
+}
+// ─── JSONL Session Helpers — streaming ───────────────────────────────────────
+/**
+ * Extract a short, human-readable summary of a tool call's primary argument.
+ * Falls back to the first string-valued property for unknown tools.
+ */
+export function summarizeArgs(toolName, args) {
+    if (!args || typeof args !== "object")
+        return "";
+    const a = args;
+    const pick = (...keys) => {
+        for (const k of keys) {
+            const v = a[k];
+            if (typeof v === "string" && v.length > 0)
+                return v;
+        }
+        return "";
+    };
+    switch (toolName) {
+        case "read":
+        case "write":
+        case "edit":
+        case "ls":
+            return pick("path", "file_path");
+        case "bash":
+            return pick("command", "cmd");
+        case "grep":
+        case "codesearch":
+        case "websearch":
+            return pick("query", "pattern", "search_term", "glob");
+        case "web_fetch":
+        case "webclaw_scrape":
+        case "lightpanda_markdown":
+        case "lightpanda_links":
+        case "lightpanda_structuredData":
+            return pick("url");
+        case "webclaw_batch":
+            return Array.isArray(a.urls) ? `${a.urls.length} urls` : pick("urls");
+        case "context7":
+            return pick("libraryId", "topic", "libraryName");
+        case "deepwiki":
+            return pick("question", "repo");
+        case "find":
+            return pick("pattern", "glob");
+        default: {
+            // Fallback: first non-empty string property
+            for (const v of Object.values(a)) {
+                if (typeof v === "string" && v.length > 0)
+                    return v;
+            }
+            return "";
+        }
+    }
+}
+/**
+ * Read the most recent tool calls from a pi JSONL session directory,
+ * with each call's status (done / error / in_progress) determined by
+ * whether a matching toolResult has been written.
+ *
+ * Returns total counts plus the last `limit` records in chronological order.
+ * Safe against malformed lines and missing fields.
+ */
+export function readRecentToolCalls(sessionDir, limit = 12, sessionName) {
+    let toolUses = 0;
+    let turns = 0;
+    const calls = [];
+    const resultsById = new Map();
+    try {
+        if (!existsSync(sessionDir))
+            return { toolUses, turns, recent: [] };
+        const views = readJsonlTailViews(sessionDir);
+        for (const view of views) {
+            if (!matchesJsonlTailViewSessionName(view, sessionName))
+                continue;
+            for (const entry of view.entries) {
+                const msg = entry.message;
+                if (typeof msg !== "object" || msg === null)
+                    continue;
+                // Collect tool results first so we can match them to tool calls
+                if (msg.role === "toolResult") {
+                    const ts = typeof msg.timestamp === "number"
+                        ? msg.timestamp
+                        : Date.parse(typeof entry.timestamp === "string" ? entry.timestamp : "") || 0;
+                    if (typeof msg.toolCallId === "string") {
+                        resultsById.set(msg.toolCallId, {
+                            isError: Boolean(msg.isError),
+                            ts,
+                        });
+                    }
+                    continue;
+                }
+                if (msg.role !== "assistant" || !Array.isArray(msg.content))
+                    continue;
+                turns++;
+                for (const block of msg.content) {
+                    if (!isUnknownRecord(block) || block.type !== "toolCall")
+                        continue;
+                    toolUses++;
+                    const id = typeof block.id === "string" ? block.id : "";
+                    if (!id)
+                        continue; // can't match results without an id
+                    calls.push({
+                        name: typeof block.name === "string" ? block.name : "tool",
+                        detail: summarizeArgs(typeof block.name === "string" ? block.name : "", block.arguments),
+                        id,
+                        ts: typeof msg.timestamp === "number"
+                            ? msg.timestamp
+                            : Date.parse(typeof entry.timestamp === "string" ? entry.timestamp : "") || 0,
+                    });
+                }
+            }
+        }
+    }
+    catch {
+        return { toolUses, turns, recent: [] };
+    }
+    // Determine status for each call, then take the last `limit` in order
+    const ordered = calls.slice().sort((a, b) => a.ts - b.ts);
+    const all = ordered.map((c) => {
+        const r = resultsById.get(c.id);
+        if (!r)
+            return {
+                name: c.name,
+                detail: c.detail,
+                id: c.id,
+                status: "in_progress",
+            };
+        return {
+            name: c.name,
+            detail: c.detail,
+            id: c.id,
+            status: r.isError ? "error" : "done",
+        };
+    });
+    const recent = all.slice(Math.max(0, all.length - limit));
+    return { toolUses, turns, recent };
+}
+function isUnknownRecord(value) {
+    return typeof value === "object" && value !== null;
+}
+export function formatElapsed(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60)
+        return `${s}s`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return r > 0 ? `${m}m ${r}s` : `${m}m`;
+}
+export function formatForegroundProgressText(progress, _theme) {
+    return [
+        `⎿ Started task ${progress.taskId} with ${progress.agentType}.`,
+        `  Subagent sessions: ${progress.sessionPath}`,
+    ].join("\n");
+}
+export function formatToolCallsSummaryBlock(recent, maxLines = 5) {
+    if (recent.length === 0)
+        return "";
+    const visible = recent.slice(-maxLines);
+    const hidden = recent.length - visible.length;
+    const lines = visible.map((c) => `  ${c.name}`);
+    if (hidden > 0) {
+        lines.unshift(`  … +${hidden} earlier`);
+    }
+    return lines.join("\n");
+}
+/**
+ * Subscribe to tool execution events from an AgentSession and update
+ * a BackgroundTask's toolUses and recentCalls in real time.
+ *
+ * Returns an unsubscribe function. Call it to clean up the subscription
+ * (e.g., when the session prompt completes or the task is cancelled).
+ */
+export function subscribeToolEvents(session, task, maxCalls = 10, onUpdate) {
+    const pending = new Map();
+    return session.subscribe((event) => {
+        if (event.type === "tool_execution_start") {
+            const record = {
+                id: event.toolCallId,
+                name: event.toolName,
+                status: "in_progress",
+                detail: JSON.stringify(event.args),
+            };
+            pending.set(record.id, record);
+            task.toolUses++;
+            task.recentCalls.push(record);
+            if (task.recentCalls.length > maxCalls)
+                task.recentCalls.splice(0, task.recentCalls.length - maxCalls);
+            onUpdate?.();
+        }
+        else if (event.type === "tool_execution_end") {
+            const existing = pending.get(event.toolCallId);
+            if (existing) {
+                existing.status = event.isError === true ? "error" : "done";
+                pending.delete(existing.id);
+                onUpdate?.();
+            }
+        }
+    });
+}

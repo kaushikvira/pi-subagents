@@ -1,0 +1,106 @@
+import { findJsonlSessionByName, mutateRegistry, upsertTaskSessionHistory, } from "../conversation.js";
+import { assessTaskResult, parseResultXml } from "../helpers.js";
+import { createSyncHerdrControl } from "../subagent/herdr.js";
+import { killAgentPane } from "../subagent/tmux.js";
+import { ignoreStaleExtensionCtx } from "../stale-ctx.js";
+import { finalizeTaskWorktree } from "../worktree.js";
+function closeTaskResource(task) {
+    if (task.handle?.backend === "herdr") {
+        createSyncHerdrControl().close(task.handle);
+    }
+    else if (task.paneId) {
+        killAgentPane(task.paneId, task.originalPane);
+    }
+}
+export function completeTask(pi, id, task, content, phase, piDir, resourceCloser = closeTaskResource) {
+    const parsed = parseResultXml(content);
+    const assessment = assessTaskResult(parsed);
+    const durationMs = Date.now() - task.startedAt;
+    const completedSessionRef = findJsonlSessionByName(piDir, task.sessionName, task.agentType)?.sessionRef;
+    if (task.worktree) {
+        try {
+            task.worktreeResult = finalizeTaskWorktree(task.worktree);
+        }
+        catch {
+            // Preserve the worktree handle for manual recovery if inspection fails.
+        }
+    }
+    upsertTaskSessionHistory(piDir, {
+        id,
+        agentType: task.agentType,
+        description: task.description,
+        sessionName: task.sessionName,
+        startedAt: task.startedAt,
+        paneId: task.paneId,
+        handle: task.handle,
+        piDir,
+        dir: task.dir,
+        cwd: task.cwd,
+        conversationId: task.conversationId,
+        sessionRef: completedSessionRef,
+        worktree: task.worktree,
+        worktreeResult: task.worktreeResult,
+        status: phase,
+        reportedStatus: assessment.reportedStatus,
+        resultValid: assessment.valid,
+        completedAt: Date.now(),
+        background: true,
+    });
+    mutateRegistry(piDir, (entries) => entries.filter((entry) => entry.id !== id));
+    try {
+        resourceCloser(task);
+    }
+    catch {
+        // Completion is already durable. Cleanup is best-effort and restore can retry it.
+    }
+    const summaryText = parsed.summary?.trim()
+        ? parsed.summary.trim()
+        : content.replace(/\s+/g, " ").trim().slice(0, 240);
+    if (task.handle?.backend === "herdr") {
+        try {
+            createSyncHerdrControl().notify(`Task ${phase}: ${task.agentType}`, summaryText.slice(0, 240), phase === "done" ? "done" : "request");
+        }
+        catch {
+            // Herdr toast delivery is optional and must not affect durable completion.
+        }
+    }
+    ignoreStaleExtensionCtx(() => pi.sendMessage({
+        customType: "task-complete",
+        content: `Background task ${id} (${task.agentType}) ${phase}.\n\n${summaryText}`,
+        display: true,
+        details: {
+            task_id: id,
+            agent_type: task.agentType,
+            description: task.description,
+            phase,
+            execution_phase: phase,
+            status: assessment.reportedStatus,
+            reported_status: assessment.reportedStatus,
+            result_valid: assessment.valid,
+            result: content,
+            summary: parsed.summary,
+            findings: parsed.findings,
+            evidence: parsed.evidence,
+            files: parsed.files,
+            caveats: parsed.caveats,
+            next_steps: parsed.next_steps,
+            confidence: parsed.confidence,
+            ...(parsed.needs_decision
+                ? { needs_decision: parsed.needs_decision }
+                : {}),
+            ...(parsed.decision_request
+                ? { decision_request: structuredClone(parsed.decision_request) }
+                : {}),
+            duration_ms: durationMs,
+            tool_uses: task.toolUses,
+            turn_count: task.turns,
+            background: true,
+            structured_result: assessment.valid,
+            full_output: parsed.raw.trim() || content.trim(),
+            worktree: task.worktreeResult,
+        },
+    }, {
+        triggerTurn: true,
+        deliverAs: "followUp",
+    }));
+}

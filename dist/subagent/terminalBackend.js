@@ -1,0 +1,195 @@
+import { execFile } from "node:child_process";
+import { chooseTmuxSplitDirection } from "../helpers.js";
+class CommandFailedError extends Error {
+    stdout;
+    stderr;
+    exitCode;
+    constructor(message, stdout, stderr, exitCode) {
+        super(message);
+        this.stdout = stdout;
+        this.stderr = stderr;
+        this.exitCode = exitCode;
+        this.name = "CommandFailedError";
+    }
+}
+export function createDefaultCommandRunner() {
+    return {
+        run(command, args, options = {}) {
+            return new Promise((resolve, reject) => {
+                const child = execFile(command, [...args], {
+                    cwd: options.cwd,
+                    env: options.env,
+                    encoding: "utf8",
+                    maxBuffer: 4 * 1024 * 1024,
+                    signal: options.signal,
+                    timeout: options.timeoutMs,
+                }, (error, stdout, stderr) => {
+                    if (error) {
+                        reject(new CommandFailedError(`${command} exited unsuccessfully${typeof error.code === "string" ? ` (${error.code})` : ""}`, stdout, stderr, typeof error.code === "number" ? error.code : undefined));
+                        return;
+                    }
+                    resolve({ stdout, stderr, exitCode: 0 });
+                });
+                if (options.input !== undefined) {
+                    child.stdin?.end(options.input);
+                }
+            });
+        },
+    };
+}
+function lastNonEmptyLine(value) {
+    return value
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .at(-1);
+}
+function positiveLineCount(lines) {
+    if (!Number.isFinite(lines))
+        return 1;
+    return Math.max(1, Math.floor(lines));
+}
+export function selectTerminalBackend(input) {
+    if (input.requested === "sdk")
+        return "sdk";
+    if (input.requested === "herdr")
+        return input.hasHerdr ? "herdr" : null;
+    if (input.requested === "tmux")
+        return input.hasTmux ? "tmux" : null;
+    if (input.hasHerdr)
+        return "herdr";
+    if (input.hasTmux)
+        return "tmux";
+    return "sdk";
+}
+export function createTmuxTerminalBackend(options = {}) {
+    const defaultRunner = createDefaultCommandRunner();
+    const runner = {
+        run: options.run ?? defaultRunner.run,
+    };
+    return {
+        kind: "tmux",
+        async available() {
+            try {
+                await runner.run("tmux", ["-V"]);
+                return true;
+            }
+            catch {
+                return false;
+            }
+        },
+        async launch(input) {
+            if (!input.command) {
+                throw new Error("tmux backend requires a launch command");
+            }
+            const configuredMode = input.direction === "right"
+                ? "horizontal"
+                : input.direction === "down"
+                    ? "vertical"
+                    : process.env.PI_TASK_TMUX_SPLIT;
+            let paneWidth = 0;
+            let paneHeight = 0;
+            if (configuredMode !== "horizontal" && configuredMode !== "vertical") {
+                try {
+                    const sizeResult = await runner.run("tmux", ["display-message", "-p", "#{pane_width} #{pane_height}"], { signal: input.signal, timeoutMs: input.timeoutMs });
+                    const [widthRaw, heightRaw] = sizeResult.stdout.trim().split(/\s+/, 2);
+                    paneWidth = Number(widthRaw);
+                    paneHeight = Number(heightRaw);
+                }
+                catch {
+                    // Missing geometry falls back to tmux's stacked split orientation.
+                }
+            }
+            const direction = chooseTmuxSplitDirection(paneWidth, paneHeight, configuredMode);
+            const result = await runner.run("tmux", [
+                "split-window",
+                direction,
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-c",
+                input.cwd,
+                input.command,
+            ], { signal: input.signal, timeoutMs: input.timeoutMs });
+            const resourceId = lastNonEmptyLine(result.stdout);
+            if (!resourceId) {
+                throw new Error("tmux did not return a pane id");
+            }
+            if (input.remainOnExit) {
+                await runner.run("tmux", ["set-option", "-p", "-t", resourceId, "remain-on-exit", "on"], { signal: input.signal, timeoutMs: input.timeoutMs });
+            }
+            return { backend: "tmux", resourceId };
+        },
+        async isAlive(handle) {
+            if (handle.backend !== "tmux")
+                return false;
+            try {
+                const result = await runner.run("tmux", [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    handle.resourceId,
+                    "#{pane_id}",
+                ]);
+                return lastNonEmptyLine(result.stdout) === handle.resourceId;
+            }
+            catch {
+                return false;
+            }
+        },
+        async send(handle, message) {
+            if (handle.backend !== "tmux") {
+                throw new Error("tmux backend cannot send to a non-tmux handle");
+            }
+            await runner.run("tmux", [
+                "send-keys",
+                "-t",
+                handle.resourceId,
+                message,
+                "Enter",
+            ]);
+        },
+        async readTail(handle, lines) {
+            if (handle.backend !== "tmux") {
+                throw new Error("tmux backend cannot read a non-tmux handle");
+            }
+            const result = await runner.run("tmux", [
+                "capture-pane",
+                "-p",
+                "-J",
+                "-S",
+                `-${positiveLineCount(lines)}`,
+                "-t",
+                handle.resourceId,
+            ]);
+            return result.stdout;
+        },
+        async close(handle) {
+            if (handle.backend !== "tmux") {
+                throw new Error("tmux backend cannot close a non-tmux handle");
+            }
+            try {
+                await runner.run("tmux", ["kill-pane", "-t", handle.resourceId]);
+            }
+            catch (error) {
+                if (!/not found|no such pane|can't find pane/i.test(String(error))) {
+                    throw error;
+                }
+            }
+        },
+    };
+}
+export function isTerminalHandle(value) {
+    if (!value || typeof value !== "object")
+        return false;
+    const candidate = value;
+    if (typeof candidate.backend !== "string" || typeof candidate.resourceId !== "string") {
+        return false;
+    }
+    if (candidate.backend === "tmux")
+        return true;
+    return (candidate.backend === "herdr" &&
+        typeof candidate.socketPath === "string" &&
+        typeof candidate.terminalId === "string");
+}
